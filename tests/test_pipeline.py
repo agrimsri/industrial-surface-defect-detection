@@ -220,6 +220,18 @@ def test_efficientnetv2_dualhead_forward():
     assert seg_logits.shape == (2, 4, 128, 800)
     print("✅ DualHeadMTFPN with tf_efficientnetv2_s verified successfully!")
 
+def test_enhanced_dualhead_forward():
+    """
+    Verifies that DualHeadMTFPN with enhanced=True supports dual pooling and learned upsampling.
+    """
+    print("\n--- Test 8: Enhanced DualHeadMTFPN with Dual Pooling & Full-Resolution Decoder ---")
+    model = DualHeadMTFPN(backbone_name='tf_efficientnetv2_s', num_classes=4, pretrained=False, enhanced=True)
+    x = torch.randn(2, 1, 128, 800)
+    cls_logits, seg_logits = model(x)
+    assert cls_logits.shape == (2, 4)
+    assert seg_logits.shape == (2, 4, 128, 800)
+    print("✅ Enhanced DualHeadMTFPN forward pass verified successfully!")
+
 if __name__ == '__main__':
     test_streaming_metric_equivalence()
     test_val_loader_sanitization()
@@ -228,4 +240,5 @@ if __name__ == '__main__':
     test_streaming_meter_per_class_metrics()
     test_joint_loss_pos_weight()
     test_efficientnetv2_dualhead_forward()
-    print("\n🎉 ALL 7 TESTS PASSED!")
+    test_enhanced_dualhead_forward()
+    print("\n🎉 ALL 8 TESTS PASSED!")

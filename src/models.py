@@ -145,6 +145,27 @@ class StandardTransferUNet(nn.Module):
 # -------------------------------------------------------------
 # Model 3: Dual-Head Multi-Task FPN (Grayscale & Stride-2 Optimized)
 # -------------------------------------------------------------
+class DualHeadPooling(nn.Module):
+    """
+    Dual AdaptiveAvgPool2d + AdaptiveMaxPool2d for peak and context defect capture.
+    Prevents thin scratches and small localized pits from having their anomaly signals
+    diluted 100x by background pixels.
+    """
+    def __init__(self, in_features, hidden_dim=128, num_classes=4, dropout=0.3):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Linear(in_features * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(hidden_dim, num_classes)
+        )
+        
+    def forward(self, x):
+        avg_p = F.adaptive_avg_pool2d(x, 1).flatten(1)
+        max_p = F.adaptive_max_pool2d(x, 1).flatten(1)
+        return self.fc(torch.cat([avg_p, max_p], dim=1))
+
 class DualHeadMTFPN(nn.Module):
     """
     Model 3: Production-Grade Multi-Task Feature Pyramid Network.
@@ -152,11 +173,12 @@ class DualHeadMTFPN(nn.Module):
     - Stride-2 High-Resolution FPN: multi-scale lateral connections across all pyramid stages
       smoothed and fused at first extracted stage resolution (stride 2 or stride 4),
       preserving fine boundary details for thin vertical scratches (defect_b) and pits (defect_a).
-    - Auxiliary Classification Head: AdaptiveAvgPool2d from deepest layer C5 predicting defect probabilities.
+    - Auxiliary Classification Head: Dual-head pooling (AvgPool + MaxPool) predicting defect probabilities.
     - Output: (cls_logits [B, 4], seg_logits [B, 4, 128, 800])
     """
-    def __init__(self, backbone_name='tf_efficientnetv2_s', num_classes=4, pretrained=True, fpn_dim=128):
+    def __init__(self, backbone_name='tf_efficientnetv2_s', num_classes=4, pretrained=True, fpn_dim=128, enhanced=False):
         super().__init__()
+        self.enhanced = enhanced
         try:
             self.encoder = timm.create_model(
                 backbone_name,
@@ -176,14 +198,17 @@ class DualHeadMTFPN(nn.Module):
         c5_ch = self.feature_channels[-1]
         
         # 1. Image-level Defect Classification Head (from C5)
-        self.cls_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Dropout(p=0.3),
-            nn.Linear(c5_ch, 128),
-            nn.GELU(),
-            nn.Linear(128, num_classes)
-        )
+        if enhanced:
+            self.cls_head = DualHeadPooling(c5_ch, hidden_dim=256, num_classes=num_classes, dropout=0.3)
+        else:
+            self.cls_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Dropout(p=0.3),
+                nn.Linear(c5_ch, 128),
+                nn.GELU(),
+                nn.Linear(128, num_classes)
+            )
         
         # 2. FPN Lateral & Smoothing Layers
         self.lateral_convs = nn.ModuleList([
@@ -198,13 +223,29 @@ class DualHeadMTFPN(nn.Module):
         ])
         
         # 3. Final Multi-Scale Segmentation Head
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(fpn_dim * len(self.feature_channels), fpn_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(fpn_dim),
-            nn.GELU(),
-            nn.Dropout2d(p=0.1),
-            nn.Conv2d(fpn_dim, num_classes, kernel_size=1)
-        )
+        if enhanced:
+            self.seg_fusion = nn.Sequential(
+                nn.Conv2d(fpn_dim * len(self.feature_channels), fpn_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(fpn_dim),
+                nn.GELU()
+            )
+            self.up_to_full = nn.Sequential(
+                nn.ConvTranspose2d(fpn_dim, 64, kernel_size=2, stride=2, bias=False),
+                nn.BatchNorm2d(64),
+                nn.GELU(),
+                nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(32),
+                nn.GELU(),
+                nn.Conv2d(32, num_classes, kernel_size=1)
+            )
+        else:
+            self.seg_head = nn.Sequential(
+                nn.Conv2d(fpn_dim * len(self.feature_channels), fpn_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(fpn_dim),
+                nn.GELU(),
+                nn.Dropout2d(p=0.1),
+                nn.Conv2d(fpn_dim, num_classes, kernel_size=1)
+            )
 
     def _adapt_first_conv_to_grayscale(self):
         conv1 = None
@@ -264,8 +305,12 @@ class DualHeadMTFPN(nn.Module):
         
         # Concatenate multi-scale representations
         fused = torch.cat(smoothed, dim=1)
-        seg_feats = self.seg_head(fused)
         
-        # Bilinear upsample to full input resolution (128, 800)
-        seg_logits = F.interpolate(seg_feats, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        if self.enhanced:
+            fused_feats = self.seg_fusion(fused)
+            seg_logits = self.up_to_full(fused_feats)
+        else:
+            seg_feats = self.seg_head(fused)
+            # Bilinear upsample to full input resolution (128, 800)
+            seg_logits = F.interpolate(seg_feats, size=x.shape[-2:], mode='bilinear', align_corners=False)
         return cls_logits, seg_logits

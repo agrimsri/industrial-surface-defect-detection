@@ -30,7 +30,8 @@ class SoftDiceLoss(nn.Module):
         if num_pos > 0:
             loss = (pos_mask * (1.0 - dice)).sum() / num_pos
         else:
-            loss = torch.tensor(0.0, device=probs.device, requires_grad=True)
+            # Differentiable graph-connected zero loss
+            loss = (probs * 0.0).sum()
         return loss
 
 class JointMultiTaskLoss(nn.Module):

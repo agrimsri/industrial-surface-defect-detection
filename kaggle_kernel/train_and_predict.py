@@ -51,10 +51,10 @@ DEFECT_TYPES = ['defect_a', 'defect_b', 'defect_c', 'defect_d']
 DEFECT_TO_IDX = {d: i for i, d in enumerate(DEFECT_TYPES)}
 IDX_TO_DEFECT = {i: d for i, d in enumerate(DEFECT_TYPES)}
 
-# Calibrated sensible default thresholds based on empirical defect distributions
-DEFAULT_CLS_THRESHOLDS = {0: 0.35, 1: 0.30, 2: 0.40, 3: 0.35}
-DEFAULT_PROB_THRESHOLDS = {0: 0.45, 1: 0.35, 2: 0.40, 3: 0.40}
-DEFAULT_MIN_SIZES = {0: 50, 1: 90, 2: 40, 3: 80}
+# Calibrated optimal thresholds based on empirical defect distributions & validation sweep
+DEFAULT_CLS_THRESHOLDS = {0: 0.30, 1: 0.40, 2: 0.35, 3: 0.25}
+DEFAULT_PROB_THRESHOLDS = {0: 0.45, 1: 0.40, 2: 0.50, 3: 0.45}
+DEFAULT_MIN_SIZES = {0: 40, 1: 200, 2: 60, 3: 200}
 
 def rle_decode(rle_str, shape=(128, 800)):
     """Decodes Run-Length Encoded string to binary mask (Fortran order, 1-indexed)."""
@@ -281,17 +281,39 @@ class TestDefectDataset(Dataset):
 # =============================================================================
 # 3. SOTA MODEL ARCHITECTURE: High-Resolution Stride-2 DualHead MT-FPN
 # =============================================================================
+class DualHeadPooling(nn.Module):
+    """
+    Dual AdaptiveAvgPool2d + AdaptiveMaxPool2d for peak and context defect capture.
+    Prevents thin scratches and small localized pits from having their anomaly signals
+    diluted 100x by background pixels.
+    """
+    def __init__(self, in_features, hidden_dim=128, num_classes=4, dropout=0.3):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Linear(in_features * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(hidden_dim, num_classes)
+        )
+        
+    def forward(self, x):
+        avg_p = F.adaptive_avg_pool2d(x, 1).flatten(1)
+        max_p = F.adaptive_max_pool2d(x, 1).flatten(1)
+        return self.fc(torch.cat([avg_p, max_p], dim=1))
+
 class DualHeadMTFPN(nn.Module):
     """
     High-Capacity Multi-Task Feature Pyramid Network.
     - Native 1-channel Grayscale Backbone (in_chans=1)
     - Stride-2 High-Resolution FPN: multi-scale lateral connections across all 5 pyramid stages
       smoothed and fused at stride 2 (64 x 400), preserving fine boundary resolution.
-    - Auxiliary Classification Head: Concat(AdaptiveAvgPool2d, AdaptiveMaxPool2d) -> Linear -> GELU -> Dropout -> Linear
+    - Auxiliary Classification Head: Dual-head pooling (AvgPool + MaxPool) predicting defect probabilities.
     - Output: (cls_logits [B, 4], seg_logits [B, 4, 128, 800])
     """
-    def __init__(self, backbone_name='tf_efficientnetv2_s', num_classes=4, pretrained=True, fpn_dim=128):
+    def __init__(self, backbone_name='tf_efficientnetv2_s', num_classes=4, pretrained=True, fpn_dim=128, enhanced=False):
         super().__init__()
+        self.enhanced = enhanced
         try:
             self.encoder = timm.create_model(
                 backbone_name,
@@ -311,14 +333,17 @@ class DualHeadMTFPN(nn.Module):
         c5_ch = self.feature_channels[-1]
         
         # Dual-head pooling for classification (AvgPool + MaxPool)
-        self.cls_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Dropout(p=0.3),
-            nn.Linear(c5_ch, 128),
-            nn.GELU(),
-            nn.Linear(128, num_classes)
-        )
+        if enhanced:
+            self.cls_head = DualHeadPooling(c5_ch, hidden_dim=256, num_classes=num_classes, dropout=0.3)
+        else:
+            self.cls_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Dropout(p=0.3),
+                nn.Linear(c5_ch, 128),
+                nn.GELU(),
+                nn.Linear(128, num_classes)
+            )
         
         # FPN Lateral convs: 1x1 convs for all 5 feature levels
         self.lateral_convs = nn.ModuleList([
@@ -335,13 +360,29 @@ class DualHeadMTFPN(nn.Module):
         ])
         
         # Segmentation head: fuses all feature levels at first extracted stage resolution (stride 2: 64 x 400)
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(fpn_dim * len(self.feature_channels), fpn_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(fpn_dim),
-            nn.GELU(),
-            nn.Dropout2d(p=0.1),
-            nn.Conv2d(fpn_dim, num_classes, kernel_size=1)
-        )
+        if enhanced:
+            self.seg_fusion = nn.Sequential(
+                nn.Conv2d(fpn_dim * len(self.feature_channels), fpn_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(fpn_dim),
+                nn.GELU()
+            )
+            self.up_to_full = nn.Sequential(
+                nn.ConvTranspose2d(fpn_dim, 64, kernel_size=2, stride=2, bias=False),
+                nn.BatchNorm2d(64),
+                nn.GELU(),
+                nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(32),
+                nn.GELU(),
+                nn.Conv2d(32, num_classes, kernel_size=1)
+            )
+        else:
+            self.seg_head = nn.Sequential(
+                nn.Conv2d(fpn_dim * len(self.feature_channels), fpn_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(fpn_dim),
+                nn.GELU(),
+                nn.Dropout2d(p=0.1),
+                nn.Conv2d(fpn_dim, num_classes, kernel_size=1)
+            )
 
     def _adapt_first_conv_to_grayscale(self):
         conv1 = None
@@ -381,7 +422,12 @@ class DualHeadMTFPN(nn.Module):
         feats = self.encoder(x)  # C1 (stride 2), C2 (4), C3 (8), C4 (16), C5 (32)
         
         # 1. Auxiliary Classification Head
-        cls_logits = self.cls_head(feats[-1])
+        if self.enhanced:
+            avg_p = F.adaptive_avg_pool2d(feats[-1], 1).flatten(1)
+            max_p = F.adaptive_max_pool2d(feats[-1], 1).flatten(1)
+            cls_logits = self.cls_head(torch.cat([avg_p, max_p], dim=1))
+        else:
+            cls_logits = self.cls_head(feats[-1])
         
         # 2. Top-down FPN pathway
         laterals = [lat(f) for lat, f in zip(self.lateral_convs, feats)]
@@ -399,10 +445,13 @@ class DualHeadMTFPN(nn.Module):
         
         # Multi-scale fusion at stride 2
         fused = torch.cat(smoothed, dim=1)
-        seg_feats = self.seg_head(fused)
-        
-        # Bilinear upsample (2x) to full input resolution (128, 800)
-        seg_logits = F.interpolate(seg_feats, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        if self.enhanced:
+            fused_feats = self.seg_fusion(fused)
+            seg_logits = self.up_to_full(fused_feats)
+        else:
+            seg_feats = self.seg_head(fused)
+            # Bilinear upsample (2x) to full input resolution (128, 800)
+            seg_logits = F.interpolate(seg_feats, size=x.shape[-2:], mode='bilinear', align_corners=False)
         return cls_logits, seg_logits
 
 # =============================================================================
@@ -433,7 +482,7 @@ class SoftDiceLoss(nn.Module):
         if num_pos > 0:
             loss = (pos_mask * (1.0 - dice)).sum() / num_pos
         else:
-            loss = torch.tensor(0.0, device=probs.device, requires_grad=True)
+            loss = (probs * 0.0).sum()
         return loss
 
 class JointMultiTaskLoss(nn.Module):
@@ -905,27 +954,27 @@ def calibrate_thresholds(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         
-    # Sensible candidate search grids tailored to physical defect morphology
+    # Empirically validated candidate search grids matching defect morphology
     class_search_grids = {
-        0: {  # defect_a: small localized pits
-            'cls': [0.30, 0.35, 0.40, 0.45, 0.50],
-            'prob': [0.40, 0.45, 0.50, 0.55],
-            'min_size': [40, 50, 60, 80]
-        },
-        1: {  # defect_b: faint vertical scratches
+        0: {  # defect_a: small localized pits (min=40, median=472)
             'cls': [0.25, 0.30, 0.35, 0.40],
-            'prob': [0.30, 0.35, 0.40, 0.45],
-            'min_size': [60, 80, 95, 110]
+            'prob': [0.40, 0.45, 0.50],
+            'min_size': [40, 60, 80]
         },
-        2: {  # defect_c: large irregular flake patches
-            'cls': [0.35, 0.40, 0.45, 0.50],
-            'prob': [0.35, 0.40, 0.45, 0.50],
-            'min_size': [35, 45, 60, 80]
+        1: {  # defect_b: faint vertical scratches (min=93, median=620)
+            'cls': [0.25, 0.30, 0.35, 0.40, 0.45],
+            'prob': [0.35, 0.40, 0.45],
+            'min_size': [80, 120, 160, 200]
         },
-        3: {  # defect_d: continuous rolling abrasion bands
+        2: {  # defect_c: large irregular flake patches (median=2313)
             'cls': [0.30, 0.35, 0.40, 0.45],
-            'prob': [0.35, 0.40, 0.45, 0.50],
-            'min_size': [60, 80, 100, 120]
+            'prob': [0.40, 0.45, 0.50],
+            'min_size': [40, 60, 80]
+        },
+        3: {  # defect_d: continuous rolling abrasion bands (min=70, median=5143)
+            'cls': [0.25, 0.30, 0.35, 0.40],
+            'prob': [0.40, 0.45, 0.50],
+            'min_size': [100, 150, 200, 300]
         }
     }
     

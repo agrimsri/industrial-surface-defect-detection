@@ -28,6 +28,9 @@ checkpoints/production/*.pth
 *.log
 wandb/
 kaggle_output/
+kaggle_output_new/
+checkpoints/*.npz
+checkpoints/*.npy
 *-publicleaderboard-*.csv
 
 # Virtual environment
