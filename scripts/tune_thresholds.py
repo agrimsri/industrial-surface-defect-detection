@@ -78,14 +78,14 @@ def tune_postprocessing_thresholds(
     # Class-specific candidate search grids tailored to each defect morphology
     class_search_grids = {
         0: {  # defect_a: small localized pits (mean area 748 px)
-            'cls': [0.10, 0.15, 0.20, 0.25, 0.30],
-            'prob': [0.25, 0.30, 0.40, 0.50],
-            'min_size': [30, 40, 50, 75]
+            'cls': [0.10, 0.20, 0.30, 0.40],
+            'prob': [0.0001, 0.0003, 0.0005, 0.001, 0.005, 0.01],
+            'min_size': [20, 30, 50, 75]
         },
         1: {  # defect_b: faint vertical scratches (rare, 313 positive instances)
-            'cls': [0.06, 0.08, 0.10, 0.12, 0.15],
-            'prob': [0.08, 0.10, 0.15, 0.20, 0.30],
-            'min_size': [20, 40, 60, 80]
+            'cls': [0.05, 0.10, 0.15, 0.20],
+            'prob': [0.00005, 0.0001, 0.0003, 0.0005, 0.001],
+            'min_size': [15, 25, 40, 60]
         },
         2: {  # defect_c: large irregular flake patches (mean area 5558 px)
             'cls': [0.30, 0.35, 0.40, 0.45, 0.50],

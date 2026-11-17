@@ -1,17 +1,18 @@
 {
   "id": "agrim26/industrial-defect-training",
   "title": "Industrial Defect Training",
-  "code_file": "train_and_predict.py",
+  "code_file": "industrial-defect-training.ipynb",
   "language": "python",
-  "kernel_type": "script",
-  "is_private": "true",
-  "enable_gpu": "true",
-  "enable_tpu": "false",
-  "enable_internet": "true",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
   "dataset_sources": [],
   "competition_sources": [
     "industrial-surface-defect-detection"
   ],
   "kernel_sources": [],
-  "model_sources": []
+  "model_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
 }
