@@ -27,6 +27,8 @@ checkpoints/production/*.pth
 # Logs and outputs
 *.log
 wandb/
+kaggle_output/
+*-publicleaderboard-*.csv
 
 # Virtual environment
 .venv/
