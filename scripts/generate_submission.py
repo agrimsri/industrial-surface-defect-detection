@@ -34,19 +34,28 @@ def generate_submission(
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
     
     # 1. Load thresholds if available
-    cls_thresh = 0.50
-    prob_thresh = 0.50
-    min_size = 50
+    cls_thresh = None
+    prob_thresh = None
+    min_size = None
     if os.path.exists(thresholds_path):
         with open(thresholds_path, 'r') as f:
             cfg = json.load(f)
-        cls_thresh = cfg.get('cls_thresh', 0.50)
-        prob_thresh = cfg.get('prob_thresh', 0.50)
-        min_size = cfg.get('min_size', 50)
+        cls_thresh = cfg.get('cls_thresh', None)
+        prob_thresh = cfg.get('prob_thresh', None)
+        min_size = cfg.get('min_size', None)
         print(f"Loaded optimal thresholds from {thresholds_path}:")
-        print(f"  tau_cls: {cls_thresh} | tau_prob: {prob_thresh} | min_size: {min_size}")
+        if isinstance(cls_thresh, dict):
+            for c_k in sorted(cls_thresh.keys()):
+                c_idx = int(c_k)
+                dname = DEFECT_TYPES[c_idx] if c_idx < len(DEFECT_TYPES) else f'class_{c_k}'
+                ct = cls_thresh.get(c_k)
+                pt = prob_thresh.get(c_k) if isinstance(prob_thresh, dict) else prob_thresh
+                ms = min_size.get(c_k) if isinstance(min_size, dict) else min_size
+                print(f"  [{dname:8s}] tau_cls: {ct} | tau_prob: {pt} | min_size: {ms}px")
+        else:
+            print(f"  tau_cls: {cls_thresh} | tau_prob: {prob_thresh} | min_size: {min_size}")
     else:
-        print(f"Using default thresholds: tau_cls={cls_thresh}, tau_prob={prob_thresh}, min_size={min_size}")
+        print("Using model default per-class thresholds.")
         
     # 2. Load model
     model = DualHeadMTFPN(backbone_name='resnet34', num_classes=4, pretrained=False).to(device)
@@ -156,6 +165,13 @@ def generate_submission(
     pos_masks = len(out_df) - empty_masks
     print(f"  Empty / Clean Masks: {empty_masks:,} ({empty_pct:.2f}%)")
     print(f"  Positive Masks: {pos_masks:,} ({100 - empty_pct:.2f}%)")
+    
+    print("\n  Per-Class Defect Counts:")
+    for d_type in DEFECT_TYPES:
+        c_count = (out_df[out_df['defect_type'] == d_type]['mask_rle'].str.strip() != '').sum()
+        print(f"    - {d_type:8s}: {c_count:5d} masks ({c_count/3000*100:.2f}% of test images)")
+        assert c_count > 0, f"Error: Defect class {d_type} has 0 predicted instances!"
+    print("  All 4 defect categories have active, non-zero predictions.")
     
     return output_path
 

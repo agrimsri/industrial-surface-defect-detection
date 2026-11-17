@@ -12,7 +12,65 @@ if '.' not in sys.path:
 from src.dataset import prepare_image_dataframe, DefectDataset
 from src.models import DualHeadMTFPN, BaselineCustomUNet
 from src.metrics import StreamingMetricMeter, compute_competition_metric
+from src.postprocess import postprocess_mask, rle_encode, rle_decode
 from src.trainer import Trainer
+
+def test_per_class_threshold_postprocessing():
+    """
+    Verifies that postprocess_mask correctly parses per-class dictionaries
+    for cls_thresh, prob_thresh, and min_size without crashing or type errors.
+    """
+    print("\n--- Test 4: Per-Class Threshold Dictionary Support ---")
+    prob_map = np.zeros((128, 800), dtype=np.float32)
+    prob_map[20:40, 20:40] = 0.45  # 400 pixels of 0.45 probability
+    
+    cls_thresh_dict = {0: 0.20, 1: 0.10, 2: 0.50, 3: 0.50}
+    prob_thresh_dict = {0: 0.40, 1: 0.20, 2: 0.50, 3: 0.50}
+    min_size_dict = {0: 50, 1: 50, 2: 50, 3: 50}
+    
+    # Class 0: cls_prob = 0.25 >= 0.20, prob 0.45 >= 0.40 -> active mask
+    mask_c0 = postprocess_mask(
+        prob_map, cls_prob=0.25, cls_idx=0,
+        cls_thresh=cls_thresh_dict, prob_thresh=prob_thresh_dict, min_size=min_size_dict
+    )
+    assert mask_c0.sum() == 400, f"Expected 400 pixels, got {mask_c0.sum()}"
+    
+    # Class 2: cls_prob = 0.25 < 0.50 (gated out) -> empty mask
+    mask_c2 = postprocess_mask(
+        prob_map, cls_prob=0.25, cls_idx=2,
+        cls_thresh=cls_thresh_dict, prob_thresh=prob_thresh_dict, min_size=min_size_dict
+    )
+    assert mask_c2.sum() == 0, f"Expected 0 pixels, got {mask_c2.sum()}"
+    print("✅ Per-class dictionary postprocessing verified successfully!")
+
+def test_streaming_meter_per_class_metrics():
+    """
+    Verifies that StreamingMetricMeter records per_class_fp, per_class_empty, and per_class_score.
+    """
+    print("\n--- Test 5: Per-Class Metric Accounting ---")
+    meter = StreamingMetricMeter(num_classes=4)
+    preds = np.zeros((4, 4, 128, 800), dtype=np.uint8)
+    targets = np.zeros((4, 4, 128, 800), dtype=np.uint8)
+    
+    # Instance 0: Class 0 positive ground truth, perfect prediction
+    targets[0, 0, 10:20, 10:20] = 1
+    preds[0, 0, 10:20, 10:20] = 1
+    
+    # Instance 1: Class 1 negative ground truth, false positive prediction (100 px)
+    preds[1, 1, 10:20, 10:20] = 1
+    
+    meter.update(preds, targets)
+    res = meter.compute()
+    
+    assert res['per_class_dice'][0] == 1.0
+    assert 'per_class_fp' in res
+    assert 'per_class_empty' in res
+    assert 'per_class_score' in res
+    # In batch of 4 samples: for class 1, 3 samples are correctly empty (1.0) and 1 is false positive (0.0) -> mean = 0.75
+    assert res['per_class_empty'][1] == 0.75
+    # False positive penalty for 100 px is 100/500 = 0.2 -> score is 0.8; remaining 3 samples are 1.0 -> mean = (3 + 0.8) / 4 = 0.95
+    assert np.isclose(res['per_class_fp'][1], 0.95)
+    print("✅ Per-class metric accounting verified successfully!")
 
 def test_streaming_metric_equivalence():
     """
@@ -130,4 +188,6 @@ if __name__ == '__main__':
     test_streaming_metric_equivalence()
     test_val_loader_sanitization()
     test_pipeline_smoke()
-    print("\n🎉 ALL TESTS PASSED!")
+    test_per_class_threshold_postprocessing()
+    test_streaming_meter_per_class_metrics()
+    print("\n🎉 ALL 5 TESTS PASSED!")

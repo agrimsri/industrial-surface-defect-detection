@@ -1,5 +1,6 @@
 import os
 import gc
+import json
 import time
 import math
 import numpy as np
@@ -37,7 +38,8 @@ class Trainer:
         experiment_name='exp_run',
         patience=3,
         min_delta=1e-4,
-        resume_checkpoint=None
+        resume_checkpoint=None,
+        postprocess_cfg=None
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -64,6 +66,19 @@ class Trainer:
         self.experiment_name = experiment_name
         self.patience = patience
         self.min_delta = min_delta
+        
+        # Parse post-processing configuration (can be dict or JSON path)
+        self.cls_thresh = None
+        self.prob_thresh = None
+        self.min_size = None
+        if postprocess_cfg is not None:
+            if isinstance(postprocess_cfg, str) and os.path.exists(postprocess_cfg):
+                with open(postprocess_cfg, 'r') as f:
+                    postprocess_cfg = json.load(f)
+            if isinstance(postprocess_cfg, dict):
+                self.cls_thresh = postprocess_cfg.get('cls_thresh')
+                self.prob_thresh = postprocess_cfg.get('prob_thresh')
+                self.min_size = postprocess_cfg.get('min_size')
         
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         is_cuda = (self.device.type == 'cuda')
@@ -205,7 +220,10 @@ class Trainer:
                     batch_binary_preds[b, c] = postprocess_mask(
                         seg_probs[b, c],
                         cls_prob=cls_probs[b, c],
-                        cls_idx=c
+                        cls_idx=c,
+                        cls_thresh=self.cls_thresh,
+                        prob_thresh=self.prob_thresh,
+                        min_size=self.min_size
                     )
                     
             # Accumulate evaluation metrics in a streaming fashion per-batch

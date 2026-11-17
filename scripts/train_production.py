@@ -84,6 +84,8 @@ def train_production_model(
     
     ckpt_path = 'checkpoints/production/dualhead_mtfpn_resnet34_best.pth'
     resume_ckpt = ckpt_path if (resume and os.path.exists(ckpt_path)) else None
+    thresh_path = 'checkpoints/production/best_thresholds.json'
+    postprocess_cfg = thresh_path if os.path.exists(thresh_path) else None
     
     # 5. Trainer with streaming metric evaluation & memory hygiene
     trainer = Trainer(
@@ -98,7 +100,8 @@ def train_production_model(
         experiment_name='dualhead_mtfpn_resnet34',
         patience=patience,
         min_delta=1e-4,
-        resume_checkpoint=resume_ckpt
+        resume_checkpoint=resume_ckpt,
+        postprocess_cfg=postprocess_cfg
     )
     
     t0 = time.time()

@@ -53,12 +53,24 @@ def postprocess_mask(prob_mask,
     2. Probability Thresholding: Binary mask = prob_mask > prob_thresh.
     3. Morphological Enhancement (defect-tailored).
     4. Component Filtering: Zero out components with area < min_size.
+    
+    Supports cls_thresh, prob_thresh, min_size as either scalar values or
+    dictionaries mapping class index (int or str) to thresholds.
     """
-    if cls_thresh is None:
+    # Resolve per-class threshold from dict, scalar, or defaults
+    if isinstance(cls_thresh, dict):
+        cls_thresh = cls_thresh.get(cls_idx, cls_thresh.get(str(cls_idx), DEFAULT_CLS_THRESHOLDS.get(cls_idx, 0.50)))
+    elif cls_thresh is None:
         cls_thresh = DEFAULT_CLS_THRESHOLDS.get(cls_idx, 0.50)
-    if prob_thresh is None:
+
+    if isinstance(prob_thresh, dict):
+        prob_thresh = prob_thresh.get(cls_idx, prob_thresh.get(str(cls_idx), DEFAULT_PROB_THRESHOLDS.get(cls_idx, 0.50)))
+    elif prob_thresh is None:
         prob_thresh = DEFAULT_PROB_THRESHOLDS.get(cls_idx, 0.50)
-    if min_size is None:
+
+    if isinstance(min_size, dict):
+        min_size = min_size.get(cls_idx, min_size.get(str(cls_idx), DEFAULT_MIN_SIZES.get(cls_idx, 50)))
+    elif min_size is None:
         min_size = DEFAULT_MIN_SIZES.get(cls_idx, 50)
 
     # Stage 1: Classification Gating

@@ -40,6 +40,8 @@ class StreamingMetricMeter:
         self.class_pos_dices = {c: [] for c in range(self.num_classes)}
         self.neg_fp_scores = []
         self.neg_empty_correct = []
+        self.class_neg_fp = {c: [] for c in range(self.num_classes)}
+        self.class_neg_empty = {c: [] for c in range(self.num_classes)}
         
     def update(self, preds, targets):
         """
@@ -83,12 +85,16 @@ class StreamingMetricMeter:
                 else:
                     # Negative ground truth instance: clean surface
                     if p_sum == 0:
-                        self.neg_fp_scores.append(1.0)
-                        self.neg_empty_correct.append(1.0)
+                        fp_score = 1.0
+                        empty_score = 1.0
                     else:
                         fp_penalty = min(1.0, float(p_sum) / 500.0)
-                        self.neg_fp_scores.append(max(0.0, 1.0 - fp_penalty))
-                        self.neg_empty_correct.append(0.0)
+                        fp_score = max(0.0, 1.0 - fp_penalty)
+                        empty_score = 0.0
+                    self.neg_fp_scores.append(fp_score)
+                    self.neg_empty_correct.append(empty_score)
+                    self.class_neg_fp[c].append(fp_score)
+                    self.class_neg_empty[c].append(empty_score)
                         
     def compute(self):
         """
@@ -104,6 +110,18 @@ class StreamingMetricMeter:
             c: (float(np.mean(self.class_pos_dices[c])) if len(self.class_pos_dices[c]) > 0 else 0.0)
             for c in range(self.num_classes)
         }
+        per_class_fp = {
+            c: (float(np.mean(self.class_neg_fp[c])) if len(self.class_neg_fp[c]) > 0 else 1.0)
+            for c in range(self.num_classes)
+        }
+        per_class_empty = {
+            c: (float(np.mean(self.class_neg_empty[c])) if len(self.class_neg_empty[c]) > 0 else 1.0)
+            for c in range(self.num_classes)
+        }
+        per_class_score = {
+            c: 0.70 * per_class_pos[c] + 0.20 * per_class_fp[c] + 0.10 * per_class_empty[c]
+            for c in range(self.num_classes)
+        }
         
         return {
             'final_score': final_score,
@@ -111,6 +129,9 @@ class StreamingMetricMeter:
             's_fp': s_fp,
             's_empty': s_empty,
             'per_class_dice': per_class_pos,
+            'per_class_fp': per_class_fp,
+            'per_class_empty': per_class_empty,
+            'per_class_score': per_class_score,
             'n_pos': len(self.pos_dices),
             'n_neg': len(self.neg_fp_scores)
         }

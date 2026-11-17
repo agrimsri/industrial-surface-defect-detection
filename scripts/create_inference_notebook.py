@@ -99,7 +99,22 @@ if os.path.exists(checkpoint_path):
 else:
     print(f"⚠️ Checkpoint not found at {checkpoint_path}. Instantiating fresh weights.")
 
-model.eval()"""))
+model.eval()
+
+# Load calibrated per-class optimal post-processing thresholds
+import json
+thresh_cfg = {}
+thresh_path = 'checkpoints/production/best_thresholds.json'
+if os.path.exists(thresh_path):
+    with open(thresh_path, 'r') as f:
+        thresh_cfg = json.load(f)
+    print(f"✅ Loaded optimal post-processing thresholds (Best Val Score: {thresh_cfg.get('best_val_score', 'N/A'):.5f})")
+    for c_i, d_name in enumerate(DEFECT_TYPES):
+        c_k = str(c_i)
+        ct = thresh_cfg.get('cls_thresh', {}).get(c_k, 0.5)
+        pt = thresh_cfg.get('prob_thresh', {}).get(c_k, 0.5)
+        ms = thresh_cfg.get('min_size', {}).get(c_k, 50)
+        print(f"   [{d_name:8s}] tau_cls: {ct} | tau_prob: {pt} | min_size: {ms}px")"""))
 
     # Section 2: Gated Inference Pipeline Function
     cells.append(nbf.v4.new_markdown_cell("""## 2. Gated Inference with Test-Time Augmentation (TTA)
@@ -129,13 +144,16 @@ def predict_image(model, img_path, device, use_tta=True):
             cls_probs = 0.5 * (cls_probs + cls_probs_flip)
             seg_probs = 0.5 * (seg_probs + seg_probs_flip)
             
-    # Apply two-stage gated post-processing per defect
+    # Apply two-stage gated post-processing per defect with calibrated per-class thresholds
     clean_masks = np.zeros((4, 128, 800), dtype=np.uint8)
     for c in range(4):
         clean_masks[c] = postprocess_mask(
             seg_probs[c],
             cls_prob=cls_probs[c],
-            cls_idx=c
+            cls_idx=c,
+            cls_thresh=thresh_cfg.get('cls_thresh'),
+            prob_thresh=thresh_cfg.get('prob_thresh'),
+            min_size=thresh_cfg.get('min_size')
         )
         
     return clean_masks, cls_probs, img"""))
