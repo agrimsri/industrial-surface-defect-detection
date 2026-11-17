@@ -78,40 +78,82 @@ def rle_encode(mask):
     return ' '.join(f'{int(s)} {int(l)}' for s, l in zip(starts, lengths))
 
 def find_data_paths():
-    """Locates train.csv, sample_submission.csv, train_dir, and test_dir dynamically."""
-    candidates = [
-        '/kaggle/input/industrial-surface-defect-detection/public',
-        '/kaggle/input/industrial-surface-defect-detection',
-        'public',
-        '.'
-    ]
-    data_dir = None
-    for cand in candidates:
-        if os.path.exists(os.path.join(cand, 'train.csv')):
-            data_dir = cand
-            break
-            
-    if data_dir is None:
-        raise FileNotFoundError(f"Could not locate train.csv in any candidate directory: {candidates}")
-        
-    train_csv = os.path.join(data_dir, 'train.csv')
-    sample_sub = os.path.join(data_dir, 'sample_submission.csv')
+    """Locates train.csv, sample_submission.csv, train_dir, and test_dir dynamically and recursively."""
+    print("🔍 Discovering dataset in filesystem...")
     
-    # Train image directory
+    # 1. Search recursively in /kaggle/input if available
+    train_csv = None
+    data_dir = None
+    if os.path.exists('/kaggle/input'):
+        print("  Scanning /kaggle/input contents:")
+        for root, dirs, files in os.walk('/kaggle/input'):
+            print(f"    - {root} (dirs: {len(dirs)}, files: {len(files)})")
+            if 'train.csv' in files and train_csv is None:
+                train_csv = os.path.join(root, 'train.csv')
+                data_dir = root
+                print(f"    ⭐ Found train.csv at: {train_csv}")
+    
+    # 2. Fallback to candidate local paths
+    if train_csv is None:
+        for cand in ['public', '.', '/kaggle/working']:
+            p = os.path.join(cand, 'train.csv')
+            if os.path.exists(p):
+                train_csv = os.path.abspath(p)
+                data_dir = os.path.dirname(train_csv)
+                break
+                
+    if train_csv is None:
+        fs_dump = []
+        for p in ['/kaggle', '.']:
+            if os.path.exists(p):
+                for r, d, f in os.walk(p):
+                    fs_dump.append(f"{r} ({len(f)} files)")
+                    if len(fs_dump) > 30:
+                        break
+        raise FileNotFoundError(f"Could not locate train.csv! Scanned paths:\n" + "\n".join(fs_dump))
+        
+    # Locate sample_submission.csv
+    sample_sub = os.path.join(data_dir, 'sample_submission.csv')
+    if not os.path.exists(sample_sub):
+        search_root = '/kaggle/input' if os.path.exists('/kaggle/input') else data_dir
+        for root, _, files in os.walk(search_root):
+            if 'sample_submission.csv' in files:
+                sample_sub = os.path.join(root, 'sample_submission.csv')
+                break
+                
+    # Locate train image directory
     train_dir = None
     for d in ['train', 'train_images']:
         p = os.path.join(data_dir, d)
         if os.path.isdir(p):
             train_dir = p
             break
-            
-    # Test image directory
+    if train_dir is None:
+        search_root = '/kaggle/input' if os.path.exists('/kaggle/input') else data_dir
+        for root, dirs, _ in os.walk(search_root):
+            for d in ['train', 'train_images']:
+                if d in dirs:
+                    train_dir = os.path.join(root, d)
+                    break
+            if train_dir:
+                break
+                
+    # Locate test image directory
     test_dir = None
     for d in ['test', 'test_images']:
         p = os.path.join(data_dir, d)
         if os.path.isdir(p):
             test_dir = p
             break
+    if test_dir is None:
+        search_root = '/kaggle/input' if os.path.exists('/kaggle/input') else data_dir
+        for root, dirs, _ in os.walk(search_root):
+            for d in ['test', 'test_images']:
+                if d in dirs:
+                    test_dir = os.path.join(root, d)
+                    break
+            if test_dir:
+                break
             
     print(f"📁 Located dataset paths:")
     print(f"   Data root:  {data_dir}")
