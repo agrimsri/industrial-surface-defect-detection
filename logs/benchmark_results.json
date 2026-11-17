@@ -1,0 +1,32 @@
+{
+  "Model 1: Custom Scratch U-Net": {
+    "best_val_score": 0.30000000000000004,
+    "best_epoch": 2,
+    "val_dice": 0.00042771535832076467,
+    "val_fp_score": 0.9946310240963855,
+    "val_empty_acc": 0.9939759036144579,
+    "final_train_loss": 0.7700860637426377,
+    "grad_norm": 0.23882834633516123,
+    "elapsed_sec": 76.17247700691223
+  },
+  "Model 2: Transfer Learning (ResNet18)": {
+    "best_val_score": 0.21209545103069055,
+    "best_epoch": 3,
+    "val_dice": 0.0004891985464253928,
+    "val_fp_score": 0.7059789156626506,
+    "val_empty_acc": 0.7055722891566265,
+    "final_train_loss": 1.0910320711135864,
+    "grad_norm": 0.3276792142046881,
+    "elapsed_sec": 61.32985973358154
+  },
+  "Model 3: Dual-Head MT-FPN (ResNet34)": {
+    "best_val_score": 0.3840573103754794,
+    "best_epoch": 3,
+    "val_dice": 0.12363178590645078,
+    "val_fp_score": 0.9917168674698795,
+    "val_empty_acc": 0.9917168674698795,
+    "final_train_loss": 0.6864319622516633,
+    "grad_norm": 1.0838013997546112,
+    "elapsed_sec": 57.122788429260254
+  }
+}

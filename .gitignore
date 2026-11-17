@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 *.so
 
-# Data and large files
+# Data and large media files
 public/
 data/
 *.zip
@@ -14,17 +14,17 @@ data/
 *.jpeg
 *.png
 
-# Checkpoints and models
-checkpoints/
-weights/
+# Heavy weights and binary models
 *.pt
 *.pth
 *.onnx
 *.engine
+weights/
+checkpoints/test/
+checkpoints/experiments/*.pth
+checkpoints/production/*.pth
 
 # Logs and outputs
-logs/
-submissions/
 *.log
 wandb/
 
