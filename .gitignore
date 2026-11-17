@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Data and large files
+public/
+data/
+*.zip
+*.tar.gz
+*.csv.gz
+*.jpg
+*.jpeg
+*.png
+
+# Checkpoints and models
+checkpoints/
+weights/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Logs and outputs
+logs/
+submissions/
+*.log
+wandb/
+
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# System and IDE
+.DS_Store
+.idea/
+.vscode/
