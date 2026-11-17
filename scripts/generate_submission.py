@@ -4,6 +4,7 @@ import gc
 import json
 import time
 import argparse
+import csv
 import cv2
 import numpy as np
 import pandas as pd
@@ -142,17 +143,18 @@ def generate_submission(
         c_idx = DEFECT_TYPES.index(d_type)
         
         rle = rle_dict.get((img_id, c_idx), '')
+        formatted_rle = str(rle).strip() if str(rle).strip() != '' else ' '
         rows.append({
             'ID': row_id,
             'image_id': img_id,
             'defect_type': d_type,
-            'mask_rle': rle
+            'mask_rle': formatted_rle
         })
         
     out_df = pd.DataFrame(rows)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    out_df.to_csv(output_path, index=False)
-    print(f"✅ Saved submission to {output_path}")
+    out_df.to_csv(output_path, index=False, quoting=csv.QUOTE_ALL)
+    print(f"✅ Saved submission to {output_path} (quoted with ' ' for empty masks)")
     
     # 6. Verification
     print("\n🔍 SUBMISSION AUDIT & INTEGRITY CHECK:")
