@@ -4,8 +4,11 @@ import torch.nn.functional as F
 
 class SoftDiceLoss(nn.Module):
     """
-    Differentiable Soft Dice Loss for binary segmentation.
-    Computes soft dice over batch and spatial dimensions.
+    Differentiable Foreground Soft Dice Loss for binary segmentation.
+    Only computes Dice loss over instances where foreground defect is present,
+    matching Kaggle's foreground-only Dice evaluation specification.
+    Prevents artificial 1.0 Dice penalties on empty slices from driving
+    minority class (defect_a, defect_b) sigmoid probabilities to 0.
     """
     def __init__(self, smooth=1.0):
         super().__init__()
@@ -16,11 +19,18 @@ class SoftDiceLoss(nn.Module):
         probs = probs.view(probs.size(0), probs.size(1), -1)
         targets = targets.view(targets.size(0), targets.size(1), -1)
         
+        t_sum = targets.sum(dim=2)
+        p_sum = probs.sum(dim=2)
         intersection = (probs * targets).sum(dim=2)
-        cardinality = probs.sum(dim=2) + targets.sum(dim=2)
         
-        dice = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
-        loss = 1.0 - dice.mean()
+        pos_mask = (t_sum > 0).float()
+        dice = (2.0 * intersection + self.smooth) / (p_sum + t_sum + self.smooth)
+        
+        num_pos = pos_mask.sum()
+        if num_pos > 0:
+            loss = (pos_mask * (1.0 - dice)).sum() / num_pos
+        else:
+            loss = torch.tensor(0.0, device=probs.device, requires_grad=True)
         return loss
 
 class JointMultiTaskLoss(nn.Module):

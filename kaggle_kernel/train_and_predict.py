@@ -353,7 +353,13 @@ class DualHeadMTFPN(nn.Module):
 # 4. LOSS FUNCTIONS
 # =============================================================================
 class SoftDiceLoss(nn.Module):
-    """Differentiable Soft Dice Loss for binary segmentation."""
+    """
+    Differentiable Foreground Soft Dice Loss for binary segmentation.
+    Only computes Dice loss over instances where foreground defect is present,
+    matching Kaggle's foreground-only Dice evaluation specification.
+    Prevents artificial 1.0 Dice penalties on empty slices from driving
+    minority class (defect_a, defect_b) sigmoid probabilities to 0.
+    """
     def __init__(self, smooth=1.0):
         super().__init__()
         self.smooth = smooth
@@ -361,10 +367,20 @@ class SoftDiceLoss(nn.Module):
     def forward(self, probs, targets):
         probs = probs.view(probs.size(0), probs.size(1), -1)
         targets = targets.view(targets.size(0), targets.size(1), -1)
+        
+        t_sum = targets.sum(dim=2)
+        p_sum = probs.sum(dim=2)
         intersection = (probs * targets).sum(dim=2)
-        cardinality = probs.sum(dim=2) + targets.sum(dim=2)
-        dice = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
-        return 1.0 - dice.mean()
+        
+        pos_mask = (t_sum > 0).float()
+        dice = (2.0 * intersection + self.smooth) / (p_sum + t_sum + self.smooth)
+        
+        num_pos = pos_mask.sum()
+        if num_pos > 0:
+            loss = (pos_mask * (1.0 - dice)).sum() / num_pos
+        else:
+            loss = torch.tensor(0.0, device=probs.device, requires_grad=True)
+        return loss
 
 class JointMultiTaskLoss(nn.Module):
     """
@@ -803,30 +819,69 @@ def calibrate_thresholds(
         c_seg = all_seg_probs[:, c]
         c_tgt = all_targets[:, c]
         
+        t_sums = c_tgt.reshape(N, -1).sum(axis=1)
+        pos_indices = np.where(t_sums > 0)[0]
+        neg_indices = np.where(t_sums == 0)[0]
+        
         best_c_score = -1.0
         best_c_config = None
         
         for ct in grid['cls']:
             for pt in grid['prob']:
                 for ms in grid['min_size']:
-                    meter = StreamingMetricMeter(num_classes=1)
-                    # Process in sub-batches
-                    sub_b = 64
-                    for s_i in range(0, N, sub_b):
-                        s_end = min(s_i + sub_b, N)
-                        sub_preds = np.zeros((s_end - s_i, 1, 128, 800), dtype=np.uint8)
-                        for b_idx, i in enumerate(range(s_i, s_end)):
-                            sub_preds[b_idx, 0] = postprocess_mask(
-                                c_seg[i].astype(np.float32),
-                                cls_prob=c_cls[i],
+                    pos_dices = []
+                    neg_fp = []
+                    neg_emp = []
+                    
+                    for idx in pos_indices:
+                        t_sum = t_sums[idx]
+                        p_cls = c_cls[idx]
+                        if p_cls < ct:
+                            pos_dices.append(0.0)
+                        else:
+                            mask = postprocess_mask(
+                                c_seg[idx].astype(np.float32),
+                                cls_prob=p_cls,
                                 cls_idx=c,
                                 cls_thresh=ct,
                                 prob_thresh=pt,
                                 min_size=ms
                             )
-                        meter.update(sub_preds, c_tgt[s_i:s_end, np.newaxis])
-                    res = meter.compute()
-                    score = res['final_score']
+                            p_sum = mask.sum()
+                            if p_sum == 0:
+                                pos_dices.append(0.0)
+                            else:
+                                inter = np.logical_and(mask, c_tgt[idx]).sum()
+                                pos_dices.append(float(2.0 * inter / (p_sum + t_sum)))
+                                
+                    for idx in neg_indices:
+                        p_cls = c_cls[idx]
+                        if p_cls < ct:
+                            neg_fp.append(1.0)
+                            neg_emp.append(1.0)
+                        else:
+                            mask = postprocess_mask(
+                                c_seg[idx].astype(np.float32),
+                                cls_prob=p_cls,
+                                cls_idx=c,
+                                cls_thresh=ct,
+                                prob_thresh=pt,
+                                min_size=ms
+                            )
+                            p_sum = mask.sum()
+                            if p_sum == 0:
+                                neg_fp.append(1.0)
+                                neg_emp.append(1.0)
+                            else:
+                                penalty = min(1.0, float(p_sum) / 500.0)
+                                neg_fp.append(max(0.0, 1.0 - penalty))
+                                neg_emp.append(0.0)
+                                
+                    s_dice = float(np.mean(pos_dices)) if pos_dices else 0.0
+                    s_fp = float(np.mean(neg_fp)) if neg_fp else 1.0
+                    s_emp = float(np.mean(neg_emp)) if neg_emp else 1.0
+                    score = 0.70 * s_dice + 0.20 * s_fp + 0.10 * s_emp
+                    
                     if score > best_c_score:
                         best_c_score = score
                         best_c_config = {'cls_thresh': ct, 'prob_thresh': pt, 'min_size': ms, 'score': score}
