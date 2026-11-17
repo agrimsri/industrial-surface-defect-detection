@@ -28,15 +28,24 @@ class JointMultiTaskLoss(nn.Module):
     Joint loss function optimizing both:
     1. Segmentation: BCEWithLogits + SoftDiceLoss
     2. Classification: BCEWithLogits on image-level defect presence
+    Supports positive class weighting (pos_weight) for minority class boosting.
     """
-    def __init__(self, cls_weight=0.5, bce_weight=0.5, dice_weight=0.5):
+    def __init__(self, cls_weight=0.5, bce_weight=0.5, dice_weight=0.5, pos_weight=None):
         super().__init__()
         self.cls_weight = cls_weight
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
-        self.bce_seg = nn.BCEWithLogitsLoss()
+        
+        if pos_weight is not None:
+            if not isinstance(pos_weight, torch.Tensor):
+                pos_weight = torch.tensor(pos_weight, dtype=torch.float32)
+            self.bce_cls = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            self.bce_seg = nn.BCEWithLogitsLoss(pos_weight=pos_weight.view(1, -1, 1, 1))
+        else:
+            self.bce_cls = nn.BCEWithLogitsLoss()
+            self.bce_seg = nn.BCEWithLogitsLoss()
+            
         self.dice_seg = SoftDiceLoss()
-        self.bce_cls = nn.BCEWithLogitsLoss()
 
     def forward(self, cls_logits, seg_logits, cls_targets, seg_targets):
         # 1. Classification loss

@@ -15,6 +15,30 @@ from src.metrics import StreamingMetricMeter, compute_competition_metric
 from src.postprocess import postprocess_mask, rle_encode, rle_decode
 from src.trainer import Trainer
 
+from src.losses import JointMultiTaskLoss
+
+def test_joint_loss_pos_weight():
+    """
+    Verifies that JointMultiTaskLoss correctly applies pos_weight on both classification and segmentation.
+    """
+    print("\n--- Test 6: JointMultiTaskLoss with pos_weight ---")
+    pos_weight = [2.0, 4.0, 1.0, 1.5]
+    criterion = JointMultiTaskLoss(pos_weight=pos_weight)
+    
+    cls_logits = torch.randn(4, 4)
+    seg_logits = torch.randn(4, 4, 128, 800)
+    cls_targets = torch.randint(0, 2, (4, 4)).float()
+    seg_targets = torch.randint(0, 2, (4, 4, 128, 800)).float()
+    
+    loss_dict = criterion(cls_logits, seg_logits, cls_targets, seg_targets)
+    assert 'total_loss' in loss_dict
+    assert 'seg_loss' in loss_dict
+    assert 'cls_loss' in loss_dict
+    assert not torch.isnan(loss_dict['total_loss'])
+    assert not torch.isinf(loss_dict['total_loss'])
+    assert loss_dict['total_loss'].item() > 0
+    print("✅ JointMultiTaskLoss with pos_weight verified successfully!")
+
 def test_per_class_threshold_postprocessing():
     """
     Verifies that postprocess_mask correctly parses per-class dictionaries
@@ -190,4 +214,5 @@ if __name__ == '__main__':
     test_pipeline_smoke()
     test_per_class_threshold_postprocessing()
     test_streaming_meter_per_class_metrics()
-    print("\n🎉 ALL 5 TESTS PASSED!")
+    test_joint_loss_pos_weight()
+    print("\n🎉 ALL 6 TESTS PASSED!")

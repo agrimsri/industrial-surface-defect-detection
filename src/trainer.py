@@ -60,8 +60,8 @@ class Trainer:
             
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.criterion = criterion if criterion is not None else JointMultiTaskLoss()
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.criterion = (criterion if criterion is not None else JointMultiTaskLoss()).to(self.device)
         self.checkpoint_dir = checkpoint_dir
         self.experiment_name = experiment_name
         self.patience = patience

@@ -79,8 +79,9 @@ def train_production_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     
-    # 4. Multi-Task Criterion
-    criterion = JointMultiTaskLoss(cls_weight=0.5, bce_weight=0.5, dice_weight=0.5)
+    # 4. Multi-Task Criterion with positive class weighting to boost minority classes
+    pos_weight = torch.tensor([2.0, 4.0, 1.0, 1.5], dtype=torch.float32)
+    criterion = JointMultiTaskLoss(cls_weight=0.5, bce_weight=0.5, dice_weight=0.5, pos_weight=pos_weight)
     
     ckpt_path = 'checkpoints/production/dualhead_mtfpn_resnet34_best.pth'
     resume_ckpt = ckpt_path if (resume and os.path.exists(ckpt_path)) else None
