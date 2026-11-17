@@ -208,6 +208,18 @@ def test_pipeline_smoke():
     assert trainer_resumed.start_epoch == 2 or trainer_resumed.start_epoch == 3
     print("✅ End-to-End Pipeline & Resume verified successfully!")
 
+def test_efficientnetv2_dualhead_forward():
+    """
+    Verifies that DualHeadMTFPN supports tf_efficientnetv2_s with stride-2 feature retention.
+    """
+    print("\n--- Test 7: DualHeadMTFPN with tf_efficientnetv2_s ---")
+    model = DualHeadMTFPN(backbone_name='tf_efficientnetv2_s', num_classes=4, pretrained=False)
+    x = torch.randn(2, 1, 128, 800)
+    cls_logits, seg_logits = model(x)
+    assert cls_logits.shape == (2, 4)
+    assert seg_logits.shape == (2, 4, 128, 800)
+    print("✅ DualHeadMTFPN with tf_efficientnetv2_s verified successfully!")
+
 if __name__ == '__main__':
     test_streaming_metric_equivalence()
     test_val_loader_sanitization()
@@ -215,4 +227,5 @@ if __name__ == '__main__':
     test_per_class_threshold_postprocessing()
     test_streaming_meter_per_class_metrics()
     test_joint_loss_pos_weight()
-    print("\n🎉 ALL 6 TESTS PASSED!")
+    test_efficientnetv2_dualhead_forward()
+    print("\n🎉 ALL 7 TESTS PASSED!")

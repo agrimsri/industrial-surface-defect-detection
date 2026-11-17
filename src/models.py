@@ -143,35 +143,44 @@ class StandardTransferUNet(nn.Module):
         return seg_logits
 
 # -------------------------------------------------------------
-# Model 3: Dual-Head Multi-Task FPN (Grayscale-Optimized)
+# Model 3: Dual-Head Multi-Task FPN (Grayscale & Stride-2 Optimized)
 # -------------------------------------------------------------
 class DualHeadMTFPN(nn.Module):
     """
     Model 3: Production-Grade Multi-Task Feature Pyramid Network.
-    - 1-channel Grayscale Conv1 adaptation (66.7% memory & bandwidth cut)
-    - Auxiliary Classification Head: Multi-label classification (p_k) from deepest layer C5
-    - Feature Pyramid Network (FPN) Decoder: Multi-scale lateral 1x1 + top-down fusion
+    - Native 1-channel Grayscale Backbone (in_chans=1)
+    - Stride-2 High-Resolution FPN: multi-scale lateral connections across all pyramid stages
+      smoothed and fused at first extracted stage resolution (stride 2 or stride 4),
+      preserving fine boundary details for thin vertical scratches (defect_b) and pits (defect_a).
+    - Auxiliary Classification Head: AdaptiveAvgPool2d from deepest layer C5 predicting defect probabilities.
     - Output: (cls_logits [B, 4], seg_logits [B, 4, 128, 800])
     """
-    def __init__(self, backbone_name='resnet34', num_classes=4, pretrained=True, fpn_dim=128):
+    def __init__(self, backbone_name='tf_efficientnetv2_s', num_classes=4, pretrained=True, fpn_dim=128):
         super().__init__()
-        self.encoder = timm.create_model(
-            backbone_name,
-            pretrained=pretrained,
-            features_only=True,
-            out_indices=(1, 2, 3, 4)  # strides 4, 8, 16, 32
-        )
+        try:
+            self.encoder = timm.create_model(
+                backbone_name,
+                pretrained=pretrained,
+                features_only=True,
+                in_chans=1
+            )
+        except Exception:
+            self.encoder = timm.create_model(
+                backbone_name,
+                pretrained=pretrained,
+                features_only=True
+            )
+            self._adapt_first_conv_to_grayscale()
+
         self.feature_channels = self.encoder.feature_info.channels()
-        
-        # Adapt first conv to 1-channel grayscale input
-        self._adapt_first_conv_to_grayscale()
+        c5_ch = self.feature_channels[-1]
         
         # 1. Image-level Defect Classification Head (from C5)
         self.cls_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Dropout(p=0.3),
-            nn.Linear(self.feature_channels[-1], 128),
+            nn.Linear(c5_ch, 128),
             nn.GELU(),
             nn.Linear(128, num_classes)
         )
@@ -234,7 +243,7 @@ class DualHeadMTFPN(nn.Module):
 
     def forward(self, x):
         # x shape: (B, 1, 128, 800)
-        feats = self.encoder(x)  # C2, C3, C4, C5
+        feats = self.encoder(x)
         
         # Auxiliary Classification Prediction
         cls_logits = self.cls_head(feats[-1])  # (B, 4)
@@ -246,18 +255,17 @@ class DualHeadMTFPN(nn.Module):
                 laterals[i + 1], size=laterals[i].shape[-2:], mode='nearest'
             )
             
-        # Smooth and upsample all pyramid levels to C2 resolution (stride 4, shape: 32 x 200)
-        c2_shape = feats[0].shape[-2:]
+        # Target size: highest resolution stage (e.g. stride 2: 64 x 400)
+        target_size = feats[0].shape[-2:]
         smoothed = [
-            F.interpolate(sm(lat), size=c2_shape, mode='bilinear', align_corners=False)
+            F.interpolate(sm(lat), size=target_size, mode='bilinear', align_corners=False)
             for sm, lat in zip(self.smooth_convs, laterals)
         ]
         
-        # Concatenate multi-scale representations: (B, 4 * fpn_dim, 32, 200)
+        # Concatenate multi-scale representations
         fused = torch.cat(smoothed, dim=1)
-        seg_feats = self.seg_head(fused)  # (B, num_classes, 32, 200)
+        seg_feats = self.seg_head(fused)
         
-        # Final bilinear upsample to full input resolution (128, 800)
+        # Bilinear upsample to full input resolution (128, 800)
         seg_logits = F.interpolate(seg_feats, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        
         return cls_logits, seg_logits
