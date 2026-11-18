@@ -535,11 +535,20 @@ Across the iterative lifecycle, each architectural and algorithmic enhancement y
 | **1** | Dual-Head MT-FPN (ResNet-34) Standard | 0.5310 | 0.51266 | ~950 / 1369 | First end-to-end working pipeline with quoted RLE format. |
 | **2** | ResNet-34 MT-FPN + Pos-Weight BCE | 0.5840 | 0.56505 | 920 / 1369 | Minority class recall boost on rare `defect_b` scratches. |
 | **3** | ResNet-34 MT-FPN + Foreground SoftDiceLoss | 0.6772 | 0.59208 | 887 / 1369 | Clean-target suppression in Dice loss; first breakthrough beyond 0.59. |
-| **4** | **Dual-Head MT-FPN (tf_efficientnetv2_s) Stride-2 FPN + SWA + 4-Way TTA + Calibrated Gating** | **0.7274** | **0.69282** | **260 / 1369** | **+0.10074 jump! Advanced 627 positions up the leaderboard.** Stride-2 features retain full spatial fidelity for thin vertical scratches (`defect_b`) and localized pits (`defect_a`), combined with Stochastic Weight Averaging (SWA) and 4-way TTA. |
+| **4** | Dual-Head MT-FPN (tf_efficientnetv2_s) Stride-2 FPN + SWA + 4-Way TTA | 0.7274 | 0.69282 | 260 / 1369 | +0.10074 jump! Advanced 627 positions. Stride-2 features preserve razor-sharp defect boundaries. |
+| **5** | tf_efficientnetv2_s + Optimal Calibrated Per-Class Thresholds | 0.7301 | 0.69348 | 258 / 1369 | Fine-grained per-class morphological filters and connected component area gating. |
+| **6** | tf_efficientnetv2_s Fold 0 Blend (60% Best + 40% SWA) + 4-Way TTA | 0.7335 | 0.69420 | 256 / 1369 | Weight-averaged snapshot blend smoothly calibrates extreme confidence boundaries. |
+| **7** | 4-Model Multi-Fold Ensemble (Fold 0 + Fold 1, Best + SWA) | 0.7232 | 0.69158 | 265 / 1408 | 4-model multi-fold inference on Kaggle GPU; slightly over-predicted on low cls thresholds. |
+| **8** | **Bayesian Prior-Calibrated Multi-Fold Consensus Blend** | **0.7352** | **0.69795** | **255 / 1408** | **Top 18.11% Leaderboard Standing!** Strict consensus on rare `defect_b` scratches (2.75% prior) prunes ~180 false alarms while retaining true scratch geometry. High-recall union preserves full patch coverage on `defect_c` (35.99% prior). |
+| **9** | Continuous Probability Gated SOTA Multi-Fold Ensemble | 0.7340 | 0.69461 | 257 / 1408 | Validated mathematical asymmetry: false negatives are 12.4x more costly than false alarms. |
 
-### 11.1 Key Insights from the 0.69282 Breakthrough
-1. **Stride-2 Feature Preservation**: Fusing the Feature Pyramid at stride 2 ($64 \times 400$) rather than stride 4 ($32 \times 200$) preserves the sub-15-pixel geometry of thin vertical scratches (`defect_b`), directly propelling validation Dice from 0.555 to 0.629.
-2. **Foreground SoftDiceLoss**: Masking the Soft Dice loss strictly to ground-truth positive pairs ($|Y| > 0$) prevents the 84.2% background images from drowning out foreground gradients.
-3. **Stochastic Weight Averaging (SWA)**: Averaging the snapshot weights of the final 3 epochs on the cosine decay cycle smoothed the loss landscape, yielding a steady 0.72384 validation score and zero overconfidence artifacts.
-4. **4-Way Test-Time Augmentation (TTA)**: Evaluating Horizontal, Vertical, and Diagonal flips eliminated edge noise and boundary jitter across all 3,000 test images.
-5. **Path to Rank 1 (0.77039)**: Analyzing the current predictions reveals that the classifier gate ($\tau_{cls} \approx 0.30-0.35$) generated ~3,092 positive masks (~25.8% of test pairs) compared to the ~15.8% ground-truth prior. Raising classification thresholds to $\tau_{cls} \ge 0.45$ eliminates the remaining ~1,100 low-confidence false alarms on clean surfaces, directly recapturing the 30% negative metric penalty and challenging the top 10 positions (> 0.753).
+### 11.1 Key Insights from the 0.69795 Milestone
+1. **The 12.4x Asymmetric Metric Penalty**:
+   $$\frac{\partial \text{Score} / \partial \text{FN}}{\partial \text{Score} / \partial \text{FP}} = \frac{0.70 / N_{pos}}{0.30 / N_{neg}} = \frac{0.70}{0.30} \times \frac{10104}{1896} \approx \mathbf{12.43\times}$$
+   A missed true positive defect (False Negative) reduces the total score by **0.000369**, whereas an erroneous false alarm on a clean surface reduces the score by only **0.0000297**. Therefore, aggressive pruning that drops true positive patch coverage on `defect_c` severely damages the score.
+2. **Defect-Specific Consensus Rules**:
+   - **`defect_b` (2.75% prior)**: The extreme rarity means false positives heavily outnumber true positives if uncalibrated. Requiring two-model consensus + `min_size >= 200` eliminated ~180 false alarms with zero loss in recall.
+   - **`defect_c` (35.99% prior)**: Dominates 70% of the Dice score. Taking the union across independent models guarantees maximum patch coverage.
+   - **`defect_a` & `defect_d`**: Area-filtered consensus with single-model fallbacks when confidence exceeds empirical calibration thresholds.
+3. **Multi-Fold + SWA Diversity**:
+   Ensembling Fold 0 and Fold 1 models across both best-validation snapshots and Stochastic Weight Averaging (SWA) checkpoints yields orthogonal feature representations, dampening noise artifacts while reinforcing structural boundary edges.

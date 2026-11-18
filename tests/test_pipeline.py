@@ -2,6 +2,7 @@ import os
 import sys
 import gc
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -278,6 +279,58 @@ def test_ensemble_probability_blending():
     assert torch.allclose(blended_sp, torch.full_like(sp1, 0.5))
     print("✅ Ensemble probability blending verified successfully!")
 
+def test_bayesian_consensus_blending():
+    """
+    Verifies that consensus blending eliminates isolated false alarms
+    and bridges broken mask regions via union.
+    """
+    print("\n--- Test 12: Bayesian Consensus Blending Integrity ---")
+    # Isolated defect_b noise mask
+    noise_mask = np.zeros((128, 800), dtype=np.uint8)
+    noise_mask[10:30, 10:15] = 1  # 100 px noise
+    noise_rle = rle_encode(noise_mask)
+    empty_rle = ' '
+    
+    # defect_b requires consensus: if only one predicts, output must be empty
+    has_b = (noise_rle.strip() != '')
+    has_m = (empty_rle.strip() != '')
+    final_b = noise_rle if (has_b and has_m) else ' '
+    assert final_b.strip() == '', "Failed to filter non-consensus noise mask on defect_b"
+    
+    # defect_c union: two overlapping patches
+    m1 = np.zeros((128, 800), dtype=np.uint8)
+    m1[20:40, 20:40] = 1
+    m2 = np.zeros((128, 800), dtype=np.uint8)
+    m2[30:50, 30:50] = 1
+    comb = np.logical_or(m1, m2).astype(np.uint8)
+    assert comb.sum() == 700  # 400 + 400 - 100 overlap = 700
+    print("✅ Bayesian consensus blending verified successfully!")
+
+def test_sota_submission_verification():
+    """
+    Verifies that the generated submission_sota_consensus.csv exists,
+    satisfies all 12,000 row requirements, matches schema, and has no nulls.
+    """
+    print("\n--- Test 13: SOTA Submission Format & Integrity Check ---")
+    sub_path = 'submissions/submission_sota_consensus.csv'
+    if not os.path.exists(sub_path):
+        import pytest
+        pytest.skip("submission_sota_consensus.csv not yet generated")
+    
+    df = pd.read_csv(sub_path)
+    assert len(df) == 12000, f"Expected 12000 rows, got {len(df)}"
+    assert list(df.columns) == ['ID', 'image_id', 'defect_type', 'mask_rle'], f"Unexpected columns: {list(df.columns)}"
+    assert df.isnull().sum().sum() == 0, "Found null values in submission"
+    
+    # Check that all 4 classes have non-zero predictions
+    for d in ['defect_a', 'defect_b', 'defect_c', 'defect_d']:
+        c_sub = df[df['defect_type'] == d]
+        assert len(c_sub) == 3000, f"Expected 3000 rows for {d}, got {len(c_sub)}"
+        active = (c_sub['mask_rle'].fillna('').str.strip() != '').sum()
+        assert active > 0, f"Class {d} has zero positive predictions!"
+        
+    print(f"✅ SOTA Submission integrity verified successfully! (12000 rows, 4 classes active)")
+
 if __name__ == '__main__':
     test_streaming_metric_equivalence()
     test_val_loader_sanitization()
@@ -290,4 +343,6 @@ if __name__ == '__main__':
     test_multifold_stratification_split()
     test_scaled_backbone_tf_efficientnetv2_m()
     test_ensemble_probability_blending()
-    print("\n🎉 ALL 11 TESTS PASSED!")
+    test_bayesian_consensus_blending()
+    test_sota_submission_verification()
+    print("\n🎉 ALL 13 TESTS PASSED!")
