@@ -677,11 +677,12 @@ class StreamingMetricMeter:
 # =============================================================================
 # 6. TRAINING ENGINE WITH GRADIENT ACCUMULATION & SWA
 # =============================================================================
-def train_model(
-    train_csv_path,
-    train_img_dir,
+def train_fold(
+    df,
+    fold=0,
+    train_img_dir='.',
     backbone='tf_efficientnetv2_s',
-    epochs=8,
+    epochs=7,
     batch_size=12,
     accum_steps=1,
     lr=5e-4,
@@ -689,26 +690,27 @@ def train_model(
     save_dir='.'
 ):
     print("=" * 80)
-    print(f"🚀 STARTING SOTA TRAINING: Dual-Head MT-FPN ({backbone} Stride-2)")
+    print(f"🚀 TRAINING FOLD {fold}: Dual-Head MT-FPN ({backbone} Stride-2)")
     print(f"Device: {device} | Epochs: {epochs} | Batch Size: {batch_size} (Accum: {accum_steps}) | LR: {lr}")
     print("=" * 80)
     
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
-    df = prepare_image_dataframe(train_csv_path, n_splits=5, seed=42)
     
-    # Curriculum: all positive defect images + balanced set of clean images
-    train_fold_df = df[df['fold'] != 0].copy()
-    val_fold_df = df[df['fold'] == 0].copy()
+    # Stratified fold split
+    train_fold_df = df[df['fold'] != fold].copy()
+    val_fold_df = df[df['fold'] == fold].copy()
     
     pos_train = train_fold_df[train_fold_df['strat_label'] != 'none']
-    clean_train = train_fold_df[train_fold_df['strat_label'] == 'none'].sample(n=3000, random_state=42)
-    balanced_train_df = pd.concat([pos_train, clean_train]).sample(frac=1.0, random_state=42).reset_index(drop=True)
+    clean_candidates = train_fold_df[train_fold_df['strat_label'] == 'none']
+    n_clean = min(3000, len(clean_candidates))
+    clean_train = clean_candidates.sample(n=n_clean, random_state=42 + fold)
+    balanced_train_df = pd.concat([pos_train, clean_train]).sample(frac=1.0, random_state=42 + fold).reset_index(drop=True)
     
     # Stratified validation set (1,000 images)
-    val_eval_df = val_fold_df.sample(n=min(1000, len(val_fold_df)), random_state=42).reset_index(drop=True)
+    val_eval_df = val_fold_df.sample(n=min(1000, len(val_fold_df)), random_state=42 + fold).reset_index(drop=True)
     
-    print(f"Train set: {len(balanced_train_df)} images ({len(pos_train)} defective + {len(clean_train)} clean)")
-    print(f"Val set:   {len(val_eval_df)} images")
+    print(f"Fold {fold} Train set: {len(balanced_train_df)} images ({len(pos_train)} defective + {len(clean_train)} clean)")
+    print(f"Fold {fold} Val set:   {len(val_eval_df)} images")
     
     train_ds = DefectDataset(balanced_train_df, img_dir=train_img_dir, is_train=True, augment=True)
     val_ds = DefectDataset(val_eval_df, img_dir=train_img_dir, is_train=False, augment=False)
@@ -752,7 +754,7 @@ def train_model(
     
     best_score = -float('inf')
     best_epoch = -1
-    best_ckpt_path = os.path.join(save_dir, 'model_best.pth')
+    best_ckpt_path = os.path.join(save_dir, f'model_fold_{fold}_best.pth')
     
     # Snapshot checkpoints for SWA ensemble
     snapshot_states = []
@@ -827,7 +829,7 @@ def train_model(
         current_lr = scheduler.get_last_lr()[0]
         
         print(
-            f"Epoch [{epoch:02d}/{epochs:02d}] ({elapsed:.1f}s, lr={current_lr:.1e}) | "
+            f"Fold {fold} Epoch [{epoch:02d}/{epochs:02d}] ({elapsed:.1f}s, lr={current_lr:.1e}) | "
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
             f"Val Score: {val_score:.5f} (Dice: {metrics['s_dice']:.4f}, FP: {metrics['s_fp']:.4f}, Emp: {metrics['s_empty']:.4f})"
         )
@@ -839,12 +841,13 @@ def train_model(
             best_epoch = epoch
             torch.save({
                 'epoch': epoch,
+                'fold': fold,
                 'model_state_dict': model.state_dict(),
                 'best_score': best_score,
                 'val_metrics': metrics,
                 'backbone': backbone
             }, best_ckpt_path)
-            print(f"  ⭐ Saved new best checkpoint (+{improvement:.5f}) to {best_ckpt_path}")
+            print(f"  ⭐ Fold {fold}: Saved new best checkpoint (+{improvement:.5f}) to {best_ckpt_path}")
             
         # Collect snapshots from the last 3 epochs for SWA
         if epoch >= max(1, epochs - 2):
@@ -855,12 +858,12 @@ def train_model(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-    print(f"\n🎉 Training complete! Best validation composite score: {best_score:.5f} (Epoch {best_epoch})")
+    print(f"\n🎉 Fold {fold} Training complete! Best validation composite score: {best_score:.5f} (Epoch {best_epoch})")
     
     # Stochastic Weight Averaging (SWA) from final snapshots
-    swa_path = os.path.join(save_dir, 'model_swa.pth')
+    swa_path = os.path.join(save_dir, f'model_fold_{fold}_swa.pth')
     if len(snapshot_states) > 1:
-        print(f"\n🔄 Building SWA Ensemble checkpoint from {len(snapshot_states)} snapshots...")
+        print(f"\n🔄 Building SWA Ensemble checkpoint for Fold {fold} from {len(snapshot_states)} snapshots...")
         swa_state = {}
         for k in snapshot_states[0].keys():
             swa_state[k] = torch.stack([s[k].float() for s in snapshot_states]).mean(dim=0)
@@ -887,9 +890,10 @@ def train_model(
                 meter.update(batch_preds, tp)
                 del images, batch, cl, sl, cp, sp, tp, batch_preds
         swa_metrics = meter.compute()
-        print(f"  SWA Val Score: {swa_metrics['final_score']:.5f} (Dice: {swa_metrics['s_dice']:.4f}, FP: {swa_metrics['s_fp']:.4f}, Emp: {swa_metrics['s_empty']:.4f})")
+        print(f"  Fold {fold} SWA Val Score: {swa_metrics['final_score']:.5f} (Dice: {swa_metrics['s_dice']:.4f}, FP: {swa_metrics['s_fp']:.4f}, Emp: {swa_metrics['s_empty']:.4f})")
         
         torch.save({
+            'fold': fold,
             'model_state_dict': swa_state,
             'best_score': swa_metrics['final_score'],
             'val_metrics': swa_metrics,
@@ -897,18 +901,23 @@ def train_model(
         }, swa_path)
         
         if swa_metrics['final_score'] > best_score:
-            print(f"  ⭐ SWA outperformed single best model ({swa_metrics['final_score']:.5f} vs {best_score:.5f})! Using SWA as primary model.")
+            print(f"  ⭐ Fold {fold}: SWA outperformed single best model ({swa_metrics['final_score']:.5f} vs {best_score:.5f})! Using SWA.")
             best_ckpt_path = swa_path
             best_score = swa_metrics['final_score']
             
-    return best_ckpt_path, val_eval_df
+    return best_ckpt_path, val_eval_df, best_score
+
+def train_model(train_csv_path, train_img_dir, backbone='tf_efficientnetv2_s', epochs=7, batch_size=12, accum_steps=1, lr=5e-4, device='cuda', save_dir='.'):
+    """Backward-compatible wrapper for single-fold training."""
+    df = prepare_image_dataframe(train_csv_path, n_splits=5, seed=42)
+    ckpt, val_df, _ = train_fold(df=df, fold=0, train_img_dir=train_img_dir, backbone=backbone, epochs=epochs, batch_size=batch_size, accum_steps=accum_steps, lr=lr, device=device, save_dir=save_dir)
+    return ckpt, val_df
 
 # =============================================================================
 # 7. SOTA OUT-OF-FOLD THRESHOLD CALIBRATION
 # =============================================================================
 def calibrate_thresholds(
-    model_path,
-    val_df,
+    model_val_pairs,
     train_img_dir,
     backbone='tf_efficientnetv2_s',
     device='cuda',
@@ -919,41 +928,50 @@ def calibrate_thresholds(
     print("=" * 80)
     
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
-    val_ds = DefectDataset(val_df, img_dir=train_img_dir, is_train=False, augment=False)
-    val_loader = DataLoader(val_ds, batch_size=16, shuffle=False, num_workers=0, pin_memory=False)
     
-    model = DualHeadMTFPN(backbone_name=backbone, num_classes=4, pretrained=False).to(device)
-    ckpt = torch.load(model_path, map_location=device)
-    model.load_state_dict(ckpt['model_state_dict'])
-    model.eval()
-    
+    if not isinstance(model_val_pairs, list):
+        # Backward compatibility if single (model_path, val_df) passed
+        model_val_pairs = [(model_val_pairs, train_img_dir)]
+        
     all_cls_probs = []
     all_seg_probs = []
     all_targets = []
     
-    with torch.no_grad():
-        for batch in val_loader:
-            images = batch['image'].to(device)
-            targets = (batch['mask'].numpy() > 0).astype(np.uint8)
-            with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=torch.float16):
-                cls_logits, seg_logits = model(images)
+    for m_path, v_df in model_val_pairs:
+        print(f"  Evaluating OOF predictions with model: {m_path} (N={len(v_df)})...")
+        val_ds = DefectDataset(v_df, img_dir=train_img_dir, is_train=False, augment=False)
+        val_loader = DataLoader(val_ds, batch_size=16, shuffle=False, num_workers=0, pin_memory=False)
+        
+        model = DualHeadMTFPN(backbone_name=backbone, num_classes=4, pretrained=False).to(device)
+        ckpt = torch.load(m_path, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        model.eval()
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                images = batch['image'].to(device)
+                targets = (batch['mask'].numpy() > 0).astype(np.uint8)
+                with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=torch.float16):
+                    cls_logits, seg_logits = model(images)
+                    
+                cls_p = torch.sigmoid(cls_logits).cpu().numpy().astype(np.float32)
+                seg_p = torch.sigmoid(seg_logits).cpu().numpy().astype(np.float16)
                 
-            cls_p = torch.sigmoid(cls_logits).cpu().numpy().astype(np.float32)
-            seg_p = torch.sigmoid(seg_logits).cpu().numpy().astype(np.float16)
-            
-            all_cls_probs.append(cls_p)
-            all_seg_probs.append(seg_p)
-            all_targets.append(targets)
-            del images, targets, cls_logits, seg_logits
+                all_cls_probs.append(cls_p)
+                all_seg_probs.append(seg_p)
+                all_targets.append(targets)
+                del images, targets, cls_logits, seg_logits
+                
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
             
     all_cls_probs = np.concatenate(all_cls_probs, axis=0)
     all_seg_probs = np.concatenate(all_seg_probs, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
+    print(f"  Total Combined Out-Of-Fold Evaluation Dataset: N = {len(all_cls_probs)} samples")
     
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        
     # Empirically validated candidate search grids matching defect morphology
     class_search_grids = {
         0: {  # defect_a: small localized pits (min=40, median=472)
@@ -1072,10 +1090,10 @@ def calibrate_thresholds(
     return cfg_to_save
 
 # =============================================================================
-# 8. TEST INFERENCE WITH 4-WAY TTA & SUBMISSION GENERATION
+# 8. TEST INFERENCE WITH 4-WAY TTA & MULTI-MODEL ENSEMBLE
 # =============================================================================
 def generate_submission(
-    model_path,
+    model_paths,
     sample_sub_path,
     test_img_dir,
     thresholds_cfg,
@@ -1085,8 +1103,12 @@ def generate_submission(
     batch_size=12,
     device='cuda'
 ):
+    if isinstance(model_paths, str):
+        model_paths = [model_paths]
+        
     print("\n" + "=" * 80)
-    print("🚀 GENERATING TEST PREDICTIONS WITH 4-WAY TTA & CALIBRATED THRESHOLDS")
+    print(f"🚀 GENERATING TEST PREDICTIONS WITH {len(model_paths)}-MODEL ENSEMBLE + 4-WAY TTA")
+    print(f"Models: {model_paths}")
     print(f"Output: {output_path} | TTA: {use_tta} | Batch Size: {batch_size}")
     print("=" * 80)
     
@@ -1095,10 +1117,14 @@ def generate_submission(
     prob_thresh = thresholds_cfg.get('prob_thresh')
     min_size = thresholds_cfg.get('min_size')
     
-    model = DualHeadMTFPN(backbone_name=backbone, num_classes=4, pretrained=False).to(device)
-    ckpt = torch.load(model_path, map_location=device)
-    model.load_state_dict(ckpt['model_state_dict'])
-    model.eval()
+    models = []
+    for mp in model_paths:
+        m = DualHeadMTFPN(backbone_name=backbone, num_classes=4, pretrained=False).to(device)
+        ckpt = torch.load(mp, map_location=device)
+        m.load_state_dict(ckpt['model_state_dict'])
+        m.eval()
+        models.append(m)
+    print(f"Successfully loaded {len(models)} models into inference memory.")
     
     sub_template = pd.read_csv(sample_sub_path)
     test_image_ids = sub_template['image_id'].unique().tolist()
@@ -1117,46 +1143,57 @@ def generate_submission(
             img_ids = batch['image_id']
             
             with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=torch.float16):
-                # 1. Base prediction
-                cls_l, seg_l = model(imgs)
-                cls_p = torch.sigmoid(cls_l)
-                seg_p = torch.sigmoid(seg_l)
+                batch_cls_list = []
+                batch_seg_list = []
                 
-                if use_tta:
-                    # 2. Horizontal Flip
-                    imgs_h = torch.flip(imgs, dims=[-1])
-                    cl_h, sl_h = model(imgs_h)
-                    cp_h = torch.sigmoid(cl_h)
-                    sp_h = torch.flip(torch.sigmoid(sl_h), dims=[-1])
+                for m in models:
+                    # 1. Base prediction
+                    cls_l, seg_l = m(imgs)
+                    cls_p = torch.sigmoid(cls_l)
+                    seg_p = torch.sigmoid(seg_l)
                     
-                    # 3. Vertical Flip
-                    imgs_v = torch.flip(imgs, dims=[-2])
-                    cl_v, sl_v = model(imgs_v)
-                    cp_v = torch.sigmoid(cl_v)
-                    sp_v = torch.flip(torch.sigmoid(sl_v), dims=[-2])
+                    if use_tta:
+                        # 2. Horizontal Flip
+                        cl_h, sl_h = m(torch.flip(imgs, dims=[-1]))
+                        cp_h = torch.sigmoid(cl_h)
+                        sp_h = torch.flip(torch.sigmoid(sl_h), dims=[-1])
+                        
+                        # 3. Vertical Flip
+                        cl_v, sl_v = m(torch.flip(imgs, dims=[-2]))
+                        cp_v = torch.sigmoid(cl_v)
+                        sp_v = torch.flip(torch.sigmoid(sl_v), dims=[-2])
+                        
+                        # 4. Horizontal + Vertical Flip
+                        cl_hv, sl_hv = m(torch.flip(imgs, dims=[-2, -1]))
+                        cp_hv = torch.sigmoid(cl_hv)
+                        sp_hv = torch.flip(torch.sigmoid(sl_hv), dims=[-2, -1])
+                        
+                        m_cls_prob = 0.25 * (cls_p + cp_h + cp_v + cp_hv)
+                        m_seg_prob = 0.25 * (seg_p + sp_h + sp_v + sp_hv)
+                        del cl_h, sl_h, cp_h, sp_h, cl_v, sl_v, cp_v, sp_v, cl_hv, sl_hv, cp_hv, sp_hv
+                    else:
+                        m_cls_prob = cls_p
+                        m_seg_prob = seg_p
+                        
+                    batch_cls_list.append(m_cls_prob)
+                    batch_seg_list.append(m_seg_prob)
+                    del cls_l, seg_l, cls_p, seg_p
                     
-                    # 4. Horizontal + Vertical Flip
-                    imgs_hv = torch.flip(imgs, dims=[-2, -1])
-                    cl_hv, sl_hv = model(imgs_hv)
-                    cp_hv = torch.sigmoid(cl_hv)
-                    sp_hv = torch.flip(torch.sigmoid(sl_hv), dims=[-2, -1])
-                    
-                    # 4-way TTA average
-                    cls_probs = 0.25 * (cls_p + cp_h + cp_v + cp_hv)
-                    seg_probs = 0.25 * (seg_p + sp_h + sp_v + sp_hv)
-                else:
-                    cls_probs = cls_p
-                    seg_probs = seg_p
-                    
-            cls_probs_np = cls_probs.cpu().numpy()
-            seg_probs_np = seg_probs.cpu().numpy()
+                # Ensemble average across all models
+                cls_probs = torch.stack(batch_cls_list, dim=0).mean(dim=0)
+                seg_probs = torch.stack(batch_seg_list, dim=0).mean(dim=0)
+                del batch_cls_list, batch_seg_list, imgs
+                
+            cls_probs_np = cls_probs.cpu().numpy().astype(np.float32)
+            seg_probs_np = seg_probs.cpu().numpy().astype(np.float16)
+            del cls_probs, seg_probs
             
             B = len(img_ids)
             for i in range(B):
                 img_id = img_ids[i]
                 for c in range(4):
                     clean_mask = postprocess_mask(
-                        seg_probs_np[i, c],
+                        seg_probs_np[i, c].astype(np.float32),
                         cls_prob=cls_probs_np[i, c],
                         cls_idx=c,
                         cls_thresh=cls_thresh,
@@ -1167,10 +1204,7 @@ def generate_submission(
                     rle_dict[(img_id, c)] = rle
                 processed_count += 1
                 
-            del imgs, cls_l, seg_l, cls_p, seg_p, cls_probs, seg_probs, cls_probs_np, seg_probs_np, batch
-            if use_tta:
-                del imgs_h, cl_h, sl_h, cp_h, sp_h, imgs_v, cl_v, sl_v, cp_v, sp_v, imgs_hv, cl_hv, sl_hv, cp_hv, sp_hv
-                
+            del seg_probs_np, cls_probs_np, batch
             if (b_idx + 1) % 50 == 0 or (b_idx + 1) == len(test_loader):
                 elapsed = time.time() - t0
                 pct = ((b_idx + 1) / len(test_loader)) * 100
@@ -1229,7 +1263,8 @@ def generate_submission(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--backbone', type=str, default='tf_efficientnetv2_s')
-    parser.add_argument('--epochs', type=int, default=8)
+    parser.add_argument('--epochs', type=int, default=7)
+    parser.add_argument('--folds', type=str, default='0,1')
     parser.add_argument('--batch-size', type=int, default=12)
     parser.add_argument('--accum-steps', type=int, default=1)
     parser.add_argument('--lr', type=float, default=5e-4)
@@ -1238,32 +1273,52 @@ def main():
     train_csv, sample_sub, train_dir, test_dir = find_data_paths()
     work_dir = '/kaggle/working' if os.path.exists('/kaggle/working') else '.'
     
-    # 1. Train SOTA Model with Gradient Accumulation & SWA
-    best_ckpt, val_df = train_model(
-        train_csv_path=train_csv,
-        train_img_dir=train_dir,
-        backbone=args.backbone,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        accum_steps=args.accum_steps,
-        lr=args.lr,
-        save_dir=work_dir
-    )
+    # 1. Parse folds and prepare data
+    folds_to_train = [int(f.strip()) for f in args.folds.split(',') if f.strip()]
+    print(f"🚀 Execution plan: Backbone={args.backbone} | Folds={folds_to_train} | Epochs per fold={args.epochs}")
+    df = prepare_image_dataframe(train_csv, n_splits=5, seed=42)
     
-    # 2. Calibrate thresholds on out-of-fold validation set
+    trained_models = []
+    val_pairs = []
+    
+    # 2. Multi-Fold Training with SWA
+    for fold in folds_to_train:
+        best_ckpt, val_df, score = train_fold(
+            df=df,
+            fold=fold,
+            train_img_dir=train_dir,
+            backbone=args.backbone,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            accum_steps=args.accum_steps,
+            lr=args.lr,
+            save_dir=work_dir
+        )
+        best_path = os.path.join(work_dir, f'model_fold_{fold}_best.pth')
+        swa_path = os.path.join(work_dir, f'model_fold_{fold}_swa.pth')
+        fold_models = []
+        if os.path.exists(best_path):
+            fold_models.append(best_path)
+        if os.path.exists(swa_path) and swa_path not in fold_models:
+            fold_models.append(swa_path)
+        if not fold_models:
+            fold_models.append(best_ckpt)
+        trained_models.extend(fold_models)
+        val_pairs.append((best_ckpt, val_df))
+        
+    # 3. Calibrate thresholds across combined Out-Of-Fold validation sets
     thresh_json = os.path.join(work_dir, 'best_thresholds.json')
     calibrated_cfg = calibrate_thresholds(
-        model_path=best_ckpt,
-        val_df=val_df,
+        model_val_pairs=val_pairs,
         train_img_dir=train_dir,
         backbone=args.backbone,
         save_path=thresh_json
     )
     
-    # 3. Predict on test set with 4-Way TTA & save submission.csv
+    # 4. Predict on test set with Multi-Fold 4-Way TTA Ensemble
     submission_path = os.path.join(work_dir, 'submission.csv')
     generate_submission(
-        model_path=best_ckpt,
+        model_paths=trained_models,
         sample_sub_path=sample_sub,
         test_img_dir=test_dir,
         thresholds_cfg=calibrated_cfg,
@@ -1272,7 +1327,7 @@ def main():
         use_tta=True,
         batch_size=args.batch_size
     )
-    print("\n🏁 SOTA PIPELINE COMPLETED SUCCESSFULLY!")
+    print("\n🏁 SOTA MULTI-FOLD ENSEMBLE PIPELINE COMPLETED SUCCESSFULLY!")
 
 if __name__ == '__main__':
     main()

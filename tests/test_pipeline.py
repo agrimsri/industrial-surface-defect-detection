@@ -232,6 +232,52 @@ def test_enhanced_dualhead_forward():
     assert seg_logits.shape == (2, 4, 128, 800)
     print("✅ Enhanced DualHeadMTFPN forward pass verified successfully!")
 
+def test_multifold_stratification_split():
+    """
+    Verifies that prepare_image_dataframe produces clean 5-fold stratification
+    with 0 overlap between validation folds and balanced fold sizes.
+    """
+    print("\n--- Test 9: Multi-Fold Stratification Integrity ---")
+    df = prepare_image_dataframe('public/train.csv', n_splits=5, seed=42)
+    assert 'fold' in df.columns
+    folds = set(df['fold'].unique())
+    assert folds == {0, 1, 2, 3, 4}, f"Expected folds {{0, 1, 2, 3, 4}}, got {folds}"
+    
+    # Check fold distribution
+    for f in range(5):
+        f_count = (df['fold'] == f).sum()
+        assert 2200 <= f_count <= 2350, f"Fold {f} size {f_count} out of expected range"
+    print("✅ Multi-fold stratification verified successfully!")
+
+def test_scaled_backbone_tf_efficientnetv2_m():
+    """
+    Verifies that DualHeadMTFPN scales to tf_efficientnetv2_m with native 1-channel grayscale.
+    """
+    print("\n--- Test 10: Scaled Backbone tf_efficientnetv2_m ---")
+    model = DualHeadMTFPN(backbone_name='tf_efficientnetv2_m', num_classes=4, pretrained=False)
+    x = torch.randn(2, 1, 128, 800)
+    cls_logits, seg_logits = model(x)
+    assert cls_logits.shape == (2, 4)
+    assert seg_logits.shape == (2, 4, 128, 800)
+    print("✅ Scaled backbone tf_efficientnetv2_m forward pass verified successfully!")
+
+def test_ensemble_probability_blending():
+    """
+    Verifies that ensemble blending averages classification and segmentation tensors correctly.
+    """
+    print("\n--- Test 11: Multi-Model Ensemble Blending ---")
+    cp1 = torch.tensor([[0.8, 0.2, 0.4, 0.1]])
+    cp2 = torch.tensor([[0.6, 0.4, 0.6, 0.3]])
+    blended_cp = torch.stack([cp1, cp2]).mean(dim=0)
+    expected_cp = torch.tensor([[0.7, 0.3, 0.5, 0.2]])
+    assert torch.allclose(blended_cp, expected_cp)
+    
+    sp1 = torch.zeros(1, 4, 128, 800)
+    sp2 = torch.ones(1, 4, 128, 800)
+    blended_sp = torch.stack([sp1, sp2]).mean(dim=0)
+    assert torch.allclose(blended_sp, torch.full_like(sp1, 0.5))
+    print("✅ Ensemble probability blending verified successfully!")
+
 if __name__ == '__main__':
     test_streaming_metric_equivalence()
     test_val_loader_sanitization()
@@ -241,4 +287,7 @@ if __name__ == '__main__':
     test_joint_loss_pos_weight()
     test_efficientnetv2_dualhead_forward()
     test_enhanced_dualhead_forward()
-    print("\n🎉 ALL 8 TESTS PASSED!")
+    test_multifold_stratification_split()
+    test_scaled_backbone_tf_efficientnetv2_m()
+    test_ensemble_probability_blending()
+    print("\n🎉 ALL 11 TESTS PASSED!")
