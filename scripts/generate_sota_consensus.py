@@ -1,23 +1,31 @@
 """
-Production SOTA Bayesian Prior-Calibrated Multi-Fold Ensemble Generator
-======================================================================
+Production SOTA Bayesian Prior-Calibrated Multi-Fold Consensus Generator
+========================================================================
 Ensemble Inputs:
 1. `submissions/submission_blend_optimal.csv` (Fold 0 Best 60% + Fold 0 SWA 40% with 4-way TTA, LB 0.69420)
 2. `submissions/submission_multifold_ensemble.csv` (Fold 0 + Fold 1 Best + SWA 4-model Kaggle GPU run, LB 0.69158)
-3. `checkpoints/test_cls_probs.npy` (4-way TTA continuous classifier probability calibration)
 
-Pruning Rationale & Metric Formulation:
+Empirical Bayesian Prior & Metric Formulation:
 Score = 0.70 * S_Dice + 0.20 * S_FP + 0.10 * S_Empty
 - 84.2% of test (image, defect_type) pairs are clean surface areas.
-- Every false alarm on a clean surface gets 0 for both S_FP and S_Empty, penalizing 30% of the metric.
-- Multi-model consensus and continuous probability gating systematically prune ~181 low-confidence
-  isolated false alarms while preserving true positive defect coverage.
+- Crucially, missing a true positive defect incurs a 12.4x larger penalty than a clean-surface false alarm:
+  (0.70 / N_pos) / (0.30 / N_neg) = (0.70 / 1896) / (0.30 / 10104) = 12.43x.
+- Therefore, aggressive pruning on defect_c (as in the prior attempt) damages Dice severely.
+- Solution:
+  1. Defect B (2.75% prior): Strict consensus requirement (both models agree) + area >= 200px
+     + vertical morphological closing (1x5) to bridge razor-thin vertical striations.
+  2. Defect C (35.99% prior): High-recall union across independent models to guarantee maximum patch coverage
+     + 3x3 morphological closing to bridge internal micro-pinholes.
+  3. Defect A (9.49% prior): Consensus agreement (area >= 50px) or high-confidence single predictions (area >= 80px)
+     + 3x3 boundary regularization.
+  4. Defect D (14.98% prior): Consensus agreement (area >= 200px) or high-confidence single predictions (area >= 300px)
+     + horizontal morphological closing (5x1) to consolidate rolling bands.
 """
 
 import os
 import sys
 import csv
-import json
+import cv2
 import numpy as np
 import pandas as pd
 
@@ -31,41 +39,37 @@ DEFECT_TYPES = ['defect_a', 'defect_b', 'defect_c', 'defect_d']
 def generate_sota_submission(
     blend_csv='submissions/submission_blend_optimal.csv',
     multifold_csv='submissions/submission_multifold_ensemble.csv',
-    probs_path='checkpoints/test_cls_probs.npy',
     sample_sub_path='public/sample_submission.csv',
     output_csv='submissions/submission_sota_consensus.csv'
 ):
-    print(f"Loading ensemble inputs:")
+    print("Loading ensemble inputs:")
     print(f"  1. Blend:     {blend_csv}")
     print(f"  2. Multifold: {multifold_csv}")
-    print(f"  3. Probs:     {probs_path}")
     
     df_b = pd.read_csv(blend_csv)
     df_m = pd.read_csv(multifold_csv)
     sub_template = pd.read_csv(sample_sub_path)
-    probs = np.load(probs_path)
     
     assert len(df_b) == 12000, f"Expected 12000 rows in blend, got {len(df_b)}"
     assert len(df_m) == 12000, f"Expected 12000 rows in multifold, got {len(df_m)}"
     assert len(sub_template) == 12000, f"Expected 12000 rows in template, got {len(sub_template)}"
     
-    test_image_ids = sub_template['image_id'].unique().tolist()
-    assert len(test_image_ids) == len(probs), "Mismatch between image IDs and probability cache"
-    id_to_idx = {img_id: i for i, img_id in enumerate(test_image_ids)}
-    c_map = {d: i for i, d in enumerate(DEFECT_TYPES)}
+    # Morphological kernels tailored to physical defect geometries
+    k_close_b = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))   # Thin vertical scratches
+    k_close_c = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))   # Irregular flake patches
+    k_close_d = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))   # Horizontal rolling bands
+    k_close_a = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))   # Localized pits / inclusions
     
     rows = []
     audit_counts = {d: 0 for d in DEFECT_TYPES}
-    pruned_counts = {d: 0 for d in DEFECT_TYPES}
+    morph_mods = {d: 0 for d in DEFECT_TYPES}
     
-    print("\nExecuting Bayesian prior-calibrated consensus blending with probability gating...")
+    print("\nExecuting Bayesian prior-calibrated consensus ensembling with morphological refinement...")
     for i in range(len(df_b)):
         row_b = df_b.iloc[i]
         row_m = df_m.iloc[i]
         d_type = row_b['defect_type']
         img_id = row_b['image_id']
-        c_idx = c_map[d_type]
-        p = float(probs[id_to_idx[img_id], c_idx])
         
         rle_b = str(row_b['mask_rle']).strip()
         rle_m = str(row_m['mask_rle']).strip()
@@ -74,63 +78,79 @@ def generate_sota_submission(
         
         final_rle = ' '
         
-        if d_type == 'defect_b':
-            # 2.75% true prior. Extreme false alarm penalty. Strict consensus + p >= 0.45.
-            if has_b and has_m and p >= 0.45:
+        if not has_b and not has_m:
+            final_rle = ' '
+        elif d_type == 'defect_b':
+            # 2.75% true prior. Strict consensus required to avoid false alarms.
+            if has_b and has_m:
                 m1 = rle_decode(rle_b, (128, 800))
                 m2 = rle_decode(rle_m, (128, 800))
                 comb = np.logical_or(m1, m2).astype(np.uint8)
-                final_rle = rle_encode(comb) if comb.sum() >= 200 else ' '
+                comb_closed = cv2.morphologyEx(comb, cv2.MORPH_CLOSE, k_close_b)
+                if (comb_closed != comb).any():
+                    morph_mods[d_type] += 1
+                final_rle = rle_encode(comb_closed) if comb_closed.sum() >= 200 else ' '
             else:
-                if has_b or has_m:
-                    pruned_counts[d_type] += 1
                 final_rle = ' '
                 
         elif d_type == 'defect_a':
-            # 9.49% true prior. Consensus union + high-confidence single predictions.
+            # 9.49% true prior. Small localized pits.
             if has_b and has_m:
                 m1 = rle_decode(rle_b, (128, 800))
                 m2 = rle_decode(rle_m, (128, 800))
                 comb = np.logical_or(m1, m2).astype(np.uint8)
-                final_rle = rle_encode(comb) if comb.sum() >= 50 else ' '
-            elif has_b and p >= 0.45:
+                comb_closed = cv2.morphologyEx(comb, cv2.MORPH_CLOSE, k_close_a)
+                if (comb_closed != comb).any():
+                    morph_mods[d_type] += 1
+                final_rle = rle_encode(comb_closed) if comb_closed.sum() >= 50 else ' '
+            elif has_b:
                 m1 = rle_decode(rle_b, (128, 800))
-                final_rle = rle_b if m1.sum() >= 80 else ' '
+                m1_closed = cv2.morphologyEx(m1, cv2.MORPH_CLOSE, k_close_a)
+                if (m1_closed != m1).any():
+                    morph_mods[d_type] += 1
+                final_rle = rle_encode(m1_closed) if m1_closed.sum() >= 80 else ' '
             else:
-                if has_b or has_m:
-                    pruned_counts[d_type] += 1
                 final_rle = ' '
                 
         elif d_type == 'defect_c':
-            # 35.99% true prior. High recall on patches, but prune unconfident multifold noise (p < 0.40).
+            # 35.99% true prior. High recall on patches, union of both models.
             if has_b and has_m:
                 m1 = rle_decode(rle_b, (128, 800))
                 m2 = rle_decode(rle_m, (128, 800))
                 comb = np.logical_or(m1, m2).astype(np.uint8)
-                final_rle = rle_encode(comb)
-            elif has_b and p >= 0.40:
+                comb_closed = cv2.morphologyEx(comb, cv2.MORPH_CLOSE, k_close_c)
+                if (comb_closed != comb).any():
+                    morph_mods[d_type] += 1
+                final_rle = rle_encode(comb_closed) if comb_closed.sum() >= 40 else ' '
+            elif has_b:
                 m1 = rle_decode(rle_b, (128, 800))
-                final_rle = rle_b if m1.sum() >= 60 else ' '
-            elif has_m and p >= 0.40:
-                m2 = rle_decode(rle_m, (128, 800))
-                final_rle = rle_m if m2.sum() >= 60 else ' '
+                m1_closed = cv2.morphologyEx(m1, cv2.MORPH_CLOSE, k_close_c)
+                if (m1_closed != m1).any():
+                    morph_mods[d_type] += 1
+                final_rle = rle_encode(m1_closed) if m1_closed.sum() >= 40 else ' '
             else:
-                if has_b or has_m:
-                    pruned_counts[d_type] += 1
-                final_rle = ' '
+                m2 = rle_decode(rle_m, (128, 800))
+                m2_closed = cv2.morphologyEx(m2, cv2.MORPH_CLOSE, k_close_c)
+                if (m2_closed != m2).any():
+                    morph_mods[d_type] += 1
+                final_rle = rle_encode(m2_closed) if m2_closed.sum() >= 40 else ' '
                 
         else:  # defect_d (14.98% true prior)
             if has_b and has_m:
                 m1 = rle_decode(rle_b, (128, 800))
                 m2 = rle_decode(rle_m, (128, 800))
                 comb = np.logical_or(m1, m2).astype(np.uint8)
-                final_rle = rle_encode(comb) if comb.sum() >= 200 else ' '
-            elif has_b and p >= 0.50:
+                comb_closed = cv2.morphologyEx(comb, cv2.MORPH_CLOSE, k_close_d)
+                if (comb_closed != comb).any():
+                    morph_mods[d_type] += 1
+                final_rle = rle_encode(comb_closed) if comb_closed.sum() >= 200 else ' '
+            elif has_b:
                 m1 = rle_decode(rle_b, (128, 800))
-                final_rle = rle_b if m1.sum() >= 300 else ' '
+                m1_closed = cv2.morphologyEx(m1, cv2.MORPH_CLOSE, k_close_d)
+                if (m1_closed != m1).any():
+                    morph_mods[d_type] += 1
+                final_rle = rle_encode(m1_closed) if m1_closed.sum() >= 300 else ' '
             else:
-                if has_b or has_m:
-                    pruned_counts[d_type] += 1
                 final_rle = ' '
                 
         if final_rle.strip() != '':
@@ -159,16 +179,12 @@ def generate_sota_submission(
     print(f"  Empty masks:  {empty_cnt:,} ({empty_cnt/len(out_df)*100:.2f}%)")
     print(f"  Active masks: {pos_cnt:,} ({pos_cnt/len(out_df)*100:.2f}%)")
     
-    print("\n  Per-Class Active Mask Counts (vs Ground Truth Prior):")
-    priors = {'defect_a': 9.49, 'defect_b': 2.75, 'defect_c': 35.99, 'defect_d': 14.98}
+    print("\n  Per-Class Defect Counts & Morphological Enhancements:")
     for d in DEFECT_TYPES:
         cnt = audit_counts[d]
-        pct = cnt / 3000 * 100
-        pruned = pruned_counts[d]
-        print(f"    - {d:8s}: {cnt:4d} masks ({pct:5.2f}% of test) | Prior: {priors[d]:5.2f}% | Pruned noise: {pruned:3d}")
-        assert cnt > 0, f"Defect class {d} has zero predictions!"
+        mods = morph_mods[d]
+        print(f"    - {d:8s}: {cnt:4d} masks ({cnt/3000*100:.2f}%) | {mods} masks refined by closing")
         
-    print("\n✅ Verification PASSED: Ready for Kaggle CLI submission.")
     return output_csv
 
 if __name__ == '__main__':
