@@ -239,6 +239,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=str, default='submissions/submission_sota_disjoint.csv')
     parser.add_argument('--blend', type=str, default='submissions/submission_blend_optimal.csv')
     parser.add_argument('--multifold', type=str, default='submissions/submission_multifold_ensemble.csv')
+    parser.add_argument('--cls-probs', type=str, default='checkpoints/test_cls_probs_5folds.npy')
     parser.add_argument('--no-disjoint', dest='disjoint', action='store_false', default=True,
                         help='Disable cross-class disjointness resolution')
     args = parser.parse_args()
@@ -246,6 +247,7 @@ if __name__ == '__main__':
     generate_sota_submission(
         blend_csv=args.blend,
         multifold_csv=args.multifold,
+        cls_probs_path=args.cls_probs,
         output_csv=args.output,
         enforce_disjoint=args.disjoint
     )
