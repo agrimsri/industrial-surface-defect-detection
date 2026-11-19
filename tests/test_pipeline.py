@@ -13,7 +13,7 @@ if '.' not in sys.path:
 from src.dataset import prepare_image_dataframe, DefectDataset
 from src.models import DualHeadMTFPN, BaselineCustomUNet
 from src.metrics import StreamingMetricMeter, compute_competition_metric
-from src.postprocess import postprocess_mask, rle_encode, rle_decode
+from src.postprocess import postprocess_mask, rle_encode, rle_decode, enforce_mask_disjointness
 from src.trainer import Trainer
 
 from src.losses import JointMultiTaskLoss
@@ -306,30 +306,73 @@ def test_bayesian_consensus_blending():
     assert comb.sum() == 700  # 400 + 400 - 100 overlap = 700
     print("✅ Bayesian consensus blending verified successfully!")
 
+def test_enforce_mask_disjointness():
+    """
+    Verifies that enforce_mask_disjointness strictly resolves contested pixels
+    between defect classes via argmax over predicted probabilities.
+    """
+    print("\n--- Test 14: Strict Mask Disjointness Resolution ---")
+    masks = np.zeros((4, 128, 800), dtype=np.uint8)
+    # Class 0 mask: 20x20 at (10:30, 10:30)
+    masks[0, 10:30, 10:30] = 1
+    # Class 2 mask: 20x20 at (20:40, 20:40)
+    masks[2, 20:40, 20:40] = 1
+
+    # Contested region is [20:30, 20:30] (10x10 = 100 pixels)
+    overlap_before = (masks.sum(axis=0) > 1).sum()
+    assert overlap_before == 100, f"Expected 100 contested pixels, got {overlap_before}"
+
+    # Set probabilities: Class 2 has 0.85, Class 0 has 0.60
+    probs = np.zeros((4, 128, 800), dtype=np.float32)
+    probs[0, 10:30, 10:30] = 0.60
+    probs[2, 20:40, 20:40] = 0.85
+
+    disjoint = enforce_mask_disjointness(masks, probs=probs)
+
+    # Invariant: 0 overlapping pixels
+    overlap_after = (disjoint.sum(axis=0) > 1).sum()
+    assert overlap_after == 0, f"Expected 0 overlapping pixels, got {overlap_after}"
+    # Class 2 should have won the contested region
+    assert (disjoint[2, 20:30, 20:30] == 1).all(), "Class 2 should own the contested region"
+    assert (disjoint[0, 20:30, 20:30] == 0).all(), "Class 0 should be 0 on contested region"
+    print("✅ Mask disjointness resolution verified successfully!")
+
 def test_sota_submission_verification():
     """
-    Verifies that the generated submission_sota_consensus.csv exists,
-    satisfies all 12,000 row requirements, matches schema, and has no nulls.
+    Verifies that the generated submissions exist,
+    satisfy all 12,000 row requirements, match schema, and have zero overlapping pixels.
     """
     print("\n--- Test 13: SOTA Submission Format & Integrity Check ---")
-    sub_path = 'submissions/submission_sota_consensus.csv'
-    if not os.path.exists(sub_path):
-        import pytest
-        pytest.skip("submission_sota_consensus.csv not yet generated")
-    
-    df = pd.read_csv(sub_path)
-    assert len(df) == 12000, f"Expected 12000 rows, got {len(df)}"
-    assert list(df.columns) == ['ID', 'image_id', 'defect_type', 'mask_rle'], f"Unexpected columns: {list(df.columns)}"
-    assert df.isnull().sum().sum() == 0, "Found null values in submission"
-    
-    # Check that all 4 classes have non-zero predictions
-    for d in ['defect_a', 'defect_b', 'defect_c', 'defect_d']:
-        c_sub = df[df['defect_type'] == d]
-        assert len(c_sub) == 3000, f"Expected 3000 rows for {d}, got {len(c_sub)}"
-        active = (c_sub['mask_rle'].fillna('').str.strip() != '').sum()
-        assert active > 0, f"Class {d} has zero positive predictions!"
+    sub_paths = ['submissions/submission_sota_disjoint.csv', 'submissions/submission_sota_consensus.csv']
+    checked = 0
+    for sub_path in sub_paths:
+        if not os.path.exists(sub_path):
+            continue
+        checked += 1
+        df = pd.read_csv(sub_path)
+        assert len(df) == 12000, f"Expected 12000 rows in {sub_path}, got {len(df)}"
+        assert list(df.columns) == ['ID', 'image_id', 'defect_type', 'mask_rle'], f"Unexpected columns: {list(df.columns)}"
+        assert df.isnull().sum().sum() == 0, f"Found null values in {sub_path}"
         
-    print(f"✅ SOTA Submission integrity verified successfully! (12000 rows, 4 classes active)")
+        # Check that all 4 classes have non-zero predictions
+        for d in ['defect_a', 'defect_b', 'defect_c', 'defect_d']:
+            c_sub = df[df['defect_type'] == d]
+            assert len(c_sub) == 3000, f"Expected 3000 rows for {d}, got {len(c_sub)}"
+            active = (c_sub['mask_rle'].fillna('').str.strip() != '').sum()
+            assert active > 0, f"Class {d} has zero positive predictions in {sub_path}!"
+            
+        if 'disjoint' in sub_path:
+            # Verify 0 overlapping pixels
+            pivoted = df.pivot(index='image_id', columns='defect_type', values='mask_rle')
+            overlap_count = 0
+            for img_id, row in pivoted.iloc[:100].iterrows():
+                m = [rle_decode(row[d]) for d in ['defect_a', 'defect_b', 'defect_c', 'defect_d']]
+                if (np.sum(m, axis=0) > 1).any():
+                    overlap_count += 1
+            assert overlap_count == 0, f"Expected 0 overlapping images in disjoint submission, found {overlap_count}"
+            
+    assert checked > 0, "No submission files found to verify"
+    print(f"✅ SOTA Submission integrity verified successfully! ({checked} files verified)")
 
 if __name__ == '__main__':
     test_streaming_metric_equivalence()
@@ -344,5 +387,6 @@ if __name__ == '__main__':
     test_scaled_backbone_tf_efficientnetv2_m()
     test_ensemble_probability_blending()
     test_bayesian_consensus_blending()
+    test_enforce_mask_disjointness()
     test_sota_submission_verification()
-    print("\n🎉 ALL 13 TESTS PASSED!")
+    print("\n🎉 ALL 14 TESTS PASSED!")
