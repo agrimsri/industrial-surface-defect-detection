@@ -42,14 +42,16 @@ def generate_sota_submission(
     multifold_csv='submissions/submission_multifold_ensemble.csv',
     sample_sub_path='public/sample_submission.csv',
     cls_probs_path='checkpoints/test_cls_probs.npy',
-    output_csv='submissions/submission_sota_disjoint.csv'
+    output_csv='submissions/submission_sota_disjoint.csv',
+    enforce_disjoint=True
 ):
     print("================================================================================")
-    print("🚀 GENERATING SOTA DISJOINT CONSENSUS ENSEMBLE SUBMISSION")
-    print(f"  1. Blend:        {blend_csv}")
-    print(f"  2. Multifold:    {multifold_csv}")
-    print(f"  3. Cls Probs:    {cls_probs_path}")
-    print(f"  4. Output CSV:   {output_csv}")
+    print("🚀 GENERATING SOTA CONSENSUS ENSEMBLE SUBMISSION")
+    print(f"  1. Blend:            {blend_csv}")
+    print(f"  2. Multifold:        {multifold_csv}")
+    print(f"  3. Cls Probs:        {cls_probs_path}")
+    print(f"  4. Enforce Disjoint: {enforce_disjoint}")
+    print(f"  5. Output CSV:       {output_csv}")
     print("================================================================================")
 
     df_b = pd.read_csv(blend_csv)
@@ -120,6 +122,12 @@ def generate_sota_submission(
                         morph_mods[d] += 1
                     if comb_closed.sum() >= 200:
                         cand_masks[c] = comb_closed
+                elif has_m and cls_probs[img_idx, c] >= 0.50:
+                    comb_closed = cv2.morphologyEx(m2, cv2.MORPH_CLOSE, kernels[c])
+                    if (comb_closed != m2).any():
+                        morph_mods[d] += 1
+                    if comb_closed.sum() >= 200:
+                        cand_masks[c] = comb_closed
 
             elif c == 0:  # defect_a (9.49% prior, p*_a in [0.08, 0.15])
                 if has_b and has_m:
@@ -163,23 +171,24 @@ def generate_sota_submission(
         # 2. Cross-Class Mask Disjointness Resolution
         overlap_map = cand_masks.sum(axis=0)
         contested = overlap_map > 1
-        if np.any(contested):
+        if enforce_disjoint and np.any(contested):
             contested_images += 1
             contested_pixels_total += int(contested.sum())
 
-            # Joint Bayesian Confidence: cls_prob * agreement_map
+            # Joint Continuous Confidence: cls_prob * agreement_map
             joint_probs = cls_probs[img_idx, :, None, None] * agrees
             disjoint_masks = enforce_mask_disjointness(
                 cand_masks,
                 probs=joint_probs,
-                class_priors=PRIORS,
+                class_priors=None,
                 min_sizes=MIN_SIZES
             )
         else:
             disjoint_masks = cand_masks
 
-        # Strict ground truth invariant check: 0 overlapping pixels
-        assert (disjoint_masks.sum(axis=0) <= 1).all(), f"Overlapping pixels remain in image {img_id}!"
+        # Strict ground truth invariant check: 0 overlapping pixels when disjointness is enforced
+        if enforce_disjoint:
+            assert (disjoint_masks.sum(axis=0) <= 1).all(), f"Overlapping pixels remain in image {img_id}!"
 
         # 3. Store final RLE predictions
         for c, d in enumerate(DEFECT_TYPES):
@@ -230,10 +239,13 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=str, default='submissions/submission_sota_disjoint.csv')
     parser.add_argument('--blend', type=str, default='submissions/submission_blend_optimal.csv')
     parser.add_argument('--multifold', type=str, default='submissions/submission_multifold_ensemble.csv')
+    parser.add_argument('--no-disjoint', dest='disjoint', action='store_false', default=True,
+                        help='Disable cross-class disjointness resolution')
     args = parser.parse_args()
 
     generate_sota_submission(
         blend_csv=args.blend,
         multifold_csv=args.multifold,
-        output_csv=args.output
+        output_csv=args.output,
+        enforce_disjoint=args.disjoint
     )

@@ -107,21 +107,24 @@ def postprocess_mask(prob_mask,
 
     return clean_mask
 
-def enforce_mask_disjointness(masks, probs=None, class_priors=None, min_sizes=None):
+def enforce_mask_disjointness(masks, probs=None, class_priors=None, min_sizes=None, min_island_size=15):
     """
     Enforces strict cross-class disjointness across all 4 defect types for a single image.
     In ground truth, defects never overlap across classes (0 overlapping pixels).
     When ensembling or processing independent sigmoid outputs, resolves pixel overlaps by
     assigning each contested pixel to the class with highest predicted probability / confidence (argmax).
 
+    Includes an area-preservation guard: pixel carving resolves boundary overlaps without
+    deleting valid pre-existing defect masks (prevents catastrophic false-negative penalty).
+
     Args:
         masks: np.ndarray of shape (C, H, W) binary masks (0 or 1), or list/dict of C masks.
         probs: optional np.ndarray of shape (C, H, W) continuous probabilities, soft
                consensus agreement, or joint confidence maps.
-        class_priors: optional list or dict of length C with empirical class priors or weights
-                      (e.g., [0.0949, 0.0275, 0.3599, 0.1498]).
-        min_sizes: optional dict or list of minimum component sizes per class to re-filter
-                   any tiny disconnected fragments caused by pixel carving.
+        class_priors: optional list or dict of length C with empirical class priors or weights.
+                      Defaults to None (pure probability argmax) to prevent prior dominance.
+        min_sizes: optional dict or list of minimum component sizes per class.
+        min_island_size: minimum pixel size for isolated detached fragments created by carving.
 
     Returns:
         disjoint_masks: np.ndarray of shape (C, H, W) binary uint8 masks with strictly zero overlapping pixels.
@@ -147,9 +150,11 @@ def enforce_mask_disjointness(masks, probs=None, class_priors=None, min_sizes=No
             probs_arr = probs_arr * p_arr[:, None, None]
         score_map = probs_arr * masks.astype(np.float32)
     else:
-        default_p = np.array([0.0949, 0.0275, 0.3599, 0.1498], dtype=np.float32)
-        p_arr = np.array([class_priors[c] if not isinstance(class_priors, dict) else class_priors.get(c, class_priors.get(str(c), default_p[c])) for c in range(C)], dtype=np.float32) if class_priors is not None else default_p
-        score_map = p_arr[:, None, None] * masks.astype(np.float32)
+        # If no continuous probabilities provided, use unweighted mask indicators
+        score_map = masks.astype(np.float32)
+        if class_priors is not None:
+            p_arr = np.array([class_priors[c] if not isinstance(class_priors, dict) else class_priors.get(c, class_priors.get(str(c), 1.0)) for c in range(C)], dtype=np.float32)
+            score_map = score_map * p_arr[:, None, None]
 
     best_c = np.argmax(score_map, axis=0)
 
@@ -158,21 +163,29 @@ def enforce_mask_disjointness(masks, probs=None, class_priors=None, min_sizes=No
         drop = contested & (best_c != c)
         disjoint_masks[c, drop] = 0
 
-    # Re-filter connected components if min_sizes provided
-    if min_sizes is not None:
-        for c in range(C):
-            ms = min_sizes.get(c, min_sizes.get(str(c), DEFAULT_MIN_SIZES.get(c, 50))) if isinstance(min_sizes, dict) else min_sizes[c]
-            b = disjoint_masks[c]
-            if not np.any(b):
-                continue
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(b, connectivity=8)
-            clean = np.zeros_like(b)
-            for lbl in range(1, num_labels):
-                if stats[lbl, cv2.CC_STAT_AREA] >= ms:
-                    clean[labels == lbl] = 1
-            if clean.sum() < ms:
-                clean.fill(0)
-            disjoint_masks[c] = clean
+    # Prune tiny detached islands (< min_island_size) created by boundary slicing
+    # while strictly preserving valid parent components
+    for c in range(C):
+        b = disjoint_masks[c]
+        if not np.any(b):
+            continue
+        ms = min_island_size
+        if min_sizes is not None:
+            ms_c = min_sizes.get(c, min_sizes.get(str(c), 50)) if isinstance(min_sizes, dict) else min_sizes[c]
+            ms = min(min_island_size, ms_c)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(b, connectivity=8)
+        clean = np.zeros_like(b)
+        for lbl in range(1, num_labels):
+            if stats[lbl, cv2.CC_STAT_AREA] >= ms:
+                clean[labels == lbl] = 1
+
+        # Area preservation guard: if all fragments were < ms but original mask was valid, keep the largest fragment
+        if clean.sum() == 0 and b.sum() > 0:
+            largest_lbl = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            clean[labels == largest_lbl] = 1
+
+        disjoint_masks[c] = clean
 
     assert (disjoint_masks.sum(axis=0) <= 1).all(), "Disjointness enforcement failed to resolve all overlaps!"
     return disjoint_masks
