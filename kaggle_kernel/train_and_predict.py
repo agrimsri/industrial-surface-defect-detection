@@ -559,15 +559,23 @@ def postprocess_mask(prob_mask,
     if not np.any(binary):
         return binary
 
-    # Stage 3: Morphological Refinement
+    # Stage 3: Class-Specific Physical Morphological Refinement
     if apply_morphology:
-        if cls_idx == 1:
-            # Vertical rectangular closing kernel to bridge broken vertical striations
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))
+        if cls_idx == 0:
+            # Defect A: Localized pits / inclusions (3x3 closing)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        elif cls_idx == 1:
+            # Defect B: Ultra-thin vertical scratches (1x5 vertical closing)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        elif cls_idx == 2:
+            # Defect C: Large irregular flake patches (3x3 closing)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         elif cls_idx == 3:
-            # Horizontal rectangular closing kernel to consolidate continuous rolling bands
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1))
+            # Defect D: Rolling abrasion bands (5x1 horizontal closing)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
     # Stage 4: Connected Component Size Filtering
@@ -1133,6 +1141,10 @@ def generate_submission(
     test_ds = TestDefectDataset(test_image_ids, img_dir=test_img_dir)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=False)
     
+    num_test = len(test_image_ids)
+    all_test_cls_probs = np.zeros((num_test, 4), dtype=np.float32)
+    all_test_seg_probs = np.zeros((num_test, 4, 128, 800), dtype=np.float16)
+
     rle_dict = {}
     t0 = time.time()
     processed_count = 0
@@ -1189,6 +1201,11 @@ def generate_submission(
             del cls_probs, seg_probs
             
             B = len(img_ids)
+            start_idx = processed_count
+            end_idx = start_idx + B
+            all_test_cls_probs[start_idx:end_idx] = cls_probs_np
+            all_test_seg_probs[start_idx:end_idx] = seg_probs_np
+
             for i in range(B):
                 img_id = img_ids[i]
                 for c in range(4):
@@ -1214,6 +1231,14 @@ def generate_submission(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    save_dir = os.path.dirname(os.path.abspath(output_path))
+    cls_save_path = os.path.join(save_dir, 'test_cls_probs.npy')
+    seg_save_path = os.path.join(save_dir, 'test_seg_probs.npy')
+    np.save(cls_save_path, all_test_cls_probs)
+    np.save(seg_save_path, all_test_seg_probs)
+    print(f"✅ Saved continuous test classification probabilities to {cls_save_path} (shape {all_test_cls_probs.shape})")
+    print(f"✅ Saved continuous test segmentation probabilities to {seg_save_path} (shape {all_test_seg_probs.shape})")
         
     print("Formatting submission rows matching sample_submission.csv...")
     rows = []
@@ -1264,7 +1289,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--backbone', type=str, default='tf_efficientnetv2_s')
     parser.add_argument('--epochs', type=int, default=7)
-    parser.add_argument('--folds', type=str, default='0,1')
+    parser.add_argument('--folds', type=str, default='2,3,4')
     parser.add_argument('--batch-size', type=int, default=12)
     parser.add_argument('--accum-steps', type=int, default=1)
     parser.add_argument('--lr', type=float, default=5e-4)
@@ -1305,6 +1330,21 @@ def main():
             fold_models.append(best_ckpt)
         trained_models.extend(fold_models)
         val_pairs.append((best_ckpt, val_df))
+
+    # 2b. Auto-discover pre-existing fold models from input sources if available
+    extra_models = []
+    if os.path.exists('/kaggle/input'):
+        for root, _, files in os.walk('/kaggle/input'):
+            for f in files:
+                if f.startswith('model_fold_') and f.endswith('.pth'):
+                    full_p = os.path.join(root, f)
+                    if full_p not in trained_models and full_p not in extra_models:
+                        extra_models.append(full_p)
+    if extra_models:
+        print(f"📦 Auto-discovered {len(extra_models)} pre-trained fold models from input sources:")
+        for em in extra_models:
+            print(f"   + {em}")
+        trained_models.extend(extra_models)
         
     # 3. Calibrate thresholds across combined Out-Of-Fold validation sets
     thresh_json = os.path.join(work_dir, 'best_thresholds.json')

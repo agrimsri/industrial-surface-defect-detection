@@ -5,7 +5,7 @@ from datetime import datetime
 
 KERNEL_NAME = "agrim26/industrial-defect-training"
 POLL_INTERVAL_SEC = 45
-MAX_WAIT_MINUTES = 120
+MAX_WAIT_MINUTES = 240
 
 print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Monitoring Kaggle kernel: {KERNEL_NAME}")
 start_time = time.time()
@@ -20,7 +20,7 @@ while True:
         )
         output = res.stdout.strip()
         elapsed_min = (time.time() - start_time) / 60.0
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ({elapsed_min:.1f}m elapsed) {output}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ({elapsed_min:.1f}m elapsed) {output}", flush=True)
         
         if "KernelWorkerStatus.COMPLETE" in output:
             print(f"✅ Kaggle kernel {KERNEL_NAME} finished successfully in {elapsed_min:.1f} minutes!")

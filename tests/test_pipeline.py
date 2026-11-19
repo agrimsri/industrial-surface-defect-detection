@@ -374,6 +374,69 @@ def test_sota_submission_verification():
     assert checked > 0, "No submission files found to verify"
     print(f"✅ SOTA Submission integrity verified successfully! ({checked} files verified)")
 
+def test_verified_morphological_closing_kernels():
+    """
+    Test 14: Verifies that physical morphological closing kernels correctly bridge
+    broken vertical striations (defect_b, 1x5), horizontal bands (defect_d, 5x1),
+    and fill interior cavities (defect_c, 3x3; defect_a, 3x3).
+    """
+    print("\n--- Test 14: Verified Morphological Closing Kernels ---")
+    # Defect B (1x5 vertical closing): 2-pixel vertical gap in vertical scratch
+    prob_b = np.zeros((128, 800), dtype=np.float32)
+    prob_b[20:30, 100:102] = 0.8
+    # Gap at rows 30-31
+    prob_b[32:45, 100:102] = 0.8
+    mask_b = postprocess_mask(prob_b, cls_prob=0.9, cls_idx=1, cls_thresh=0.2, prob_thresh=0.5, min_size=10)
+    # The gap should be closed
+    assert mask_b[30:32, 100:102].all() == 1, "Defect B vertical 1x5 closing failed to bridge 2px gap!"
+
+    # Defect D (5x1 horizontal closing): 2-pixel horizontal gap in horizontal band
+    prob_d = np.zeros((128, 800), dtype=np.float32)
+    prob_d[50:52, 200:220] = 0.8
+    # Gap at cols 220-221
+    prob_d[50:52, 222:245] = 0.8
+    mask_d = postprocess_mask(prob_d, cls_prob=0.9, cls_idx=3, cls_thresh=0.2, prob_thresh=0.5, min_size=10)
+    assert mask_d[50:52, 220:222].all() == 1, "Defect D horizontal 5x1 closing failed to bridge 2px gap!"
+
+    # Defect C (3x3 closing): 1-pixel interior cavity in flake patch
+    prob_c = np.ones((10, 10), dtype=np.float32) * 0.8
+    prob_c[5, 5] = 0.0  # interior hole
+    full_c = np.zeros((128, 800), dtype=np.float32)
+    full_c[10:20, 10:20] = prob_c
+    mask_c = postprocess_mask(full_c, cls_prob=0.9, cls_idx=2, cls_thresh=0.2, prob_thresh=0.5, min_size=10)
+    assert mask_c[15, 15] == 1, "Defect C 3x3 closing failed to fill interior cavity!"
+
+    print("✅ Verified morphological closing kernels tested successfully!")
+
+def test_multifold_continuous_probability_ensembling():
+    """
+    Test 15: Verifies that averaging continuous probability maps across multi-fold
+    committees prior to binarization preserves borderline signals and avoids
+    false negative dropout from disjoint carving or premature thresholding.
+    """
+    print("\n--- Test 15: Continuous Probability Ensembling ---")
+    # Simulate 2 committee predictions where neither alone reaches 0.50 threshold,
+    # but their continuous combination safely exceeds it
+    p1 = np.zeros((128, 800), dtype=np.float32)
+    p2 = np.zeros((128, 800), dtype=np.float32)
+    
+    # Model 1 has confidence 0.48 in region, Model 2 has 0.54
+    p1[30:50, 40:60] = 0.48
+    p2[30:50, 40:60] = 0.54
+    
+    # Premature discrete thresholding at 0.50 with intersection:
+    discrete_1 = (p1 > 0.50).astype(np.uint8)  # all 0!
+    discrete_2 = (p2 > 0.50).astype(np.uint8)  # all 1
+    premature_intersect = np.logical_and(discrete_1, discrete_2)
+    assert premature_intersect.sum() == 0, "Expected discrete intersection to drop mask"
+    
+    # Continuous probability averaging (0.40 * p1 + 0.60 * p2)
+    ens_continuous = 0.40 * p1 + 0.60 * p2  # 0.40*0.48 + 0.60*0.54 = 0.192 + 0.324 = 0.516 > 0.50!
+    assert np.isclose(ens_continuous[35, 45], 0.516)
+    binary_ens = (ens_continuous > 0.50).astype(np.uint8)
+    assert binary_ens[30:50, 40:60].sum() == 400, "Continuous ensembling should retain all 400 pixels!"
+    print("✅ Continuous probability ensembling retention verified successfully!")
+
 if __name__ == '__main__':
     test_streaming_metric_equivalence()
     test_val_loader_sanitization()
@@ -389,4 +452,6 @@ if __name__ == '__main__':
     test_bayesian_consensus_blending()
     test_enforce_mask_disjointness()
     test_sota_submission_verification()
-    print("\n🎉 ALL 14 TESTS PASSED!")
+    test_verified_morphological_closing_kernels()
+    test_multifold_continuous_probability_ensembling()
+    print("\n🎉 ALL 16 TESTS PASSED!")

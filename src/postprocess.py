@@ -84,12 +84,20 @@ def postprocess_mask(prob_mask,
 
     # Stage 3: Class-Specific Morphological Refinement
     if apply_morphology:
-        if cls_idx == 1:
-            # Defect B: Ultra-thin vertical scratches. Close vertical gaps.
+        if cls_idx == 0:
+            # Defect A: Localized pits / inclusions (3x3 closing)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        elif cls_idx == 1:
+            # Defect B: Ultra-thin vertical scratches. Close vertical gaps (1x5 vertical closing)
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        elif cls_idx == 2:
+            # Defect C: Large irregular flake patches (3x3 closing)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         elif cls_idx == 3:
-            # Defect D: Rolling abrasion bands. Dilate horizontally.
+            # Defect D: Rolling abrasion bands. Dilate horizontally (5x1 horizontal closing)
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
