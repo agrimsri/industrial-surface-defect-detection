@@ -586,6 +586,24 @@ def test_hetero_ensemble_blending():
     shutil.rmtree(test_dir)
     print("✅ Heterogeneous ensemble blending verified successfully!")
 
+def test_committee_recall_preservation():
+    """
+    Test 20: Verifies that heterogeneous ensembling preserves 100% of detections from
+    the 5-fold committee (protecting against the 12.43x asymmetric false negative penalty).
+    """
+    print("\n--- Test 20: 100% Committee Recall Preservation Guard ---")
+    comm_path = 'submissions/submission_5fold_committee.csv'
+    hetero_path = 'submissions/submission_sota_hetero_ensemble.csv'
+    if not (os.path.exists(comm_path) and os.path.exists(hetero_path)):
+        pytest.skip("Submissions not available locally")
+    comm = pd.read_csv(comm_path)
+    hetero = pd.read_csv(hetero_path)
+    comm_pos = comm['mask_rle'].fillna('').str.strip() != ''
+    hetero_pos = hetero['mask_rle'].fillna('').str.strip() != ''
+    dropped = comm_pos & (~hetero_pos)
+    assert dropped.sum() == 0, f"Critical Regression: {dropped.sum()} committee masks were dropped by blending!"
+    print("✅ 100% committee recall preservation verified successfully!")
+
 if __name__ == '__main__':
     test_streaming_metric_equivalence()
     test_val_loader_sanitization()
@@ -606,4 +624,5 @@ if __name__ == '__main__':
     test_seresnext50_unet_forward()
     test_lovasz_hinge_loss()
     test_hetero_ensemble_blending()
-    print("\n🎉 ALL 19 TESTS PASSED!")
+    test_committee_recall_preservation()
+    print("\n🎉 ALL 20 TESTS PASSED!")
