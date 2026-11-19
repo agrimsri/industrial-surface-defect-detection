@@ -38,13 +38,17 @@ PRIORS = [0.0949, 0.0275, 0.3599, 0.1498]
 MIN_SIZES = {0: 50, 1: 160, 2: 40, 3: 200}
 
 def generate_sota_submission(
-    blend_csv='submissions/submission_blend_optimal.csv',
-    multifold_csv='submissions/submission_multifold_ensemble.csv',
+    blend_csv=None,
+    multifold_csv=None,
     sample_sub_path='public/sample_submission.csv',
-    cls_probs_path='checkpoints/test_cls_probs.npy',
-    output_csv='submissions/submission_sota_disjoint.csv',
-    enforce_disjoint=True
+    cls_probs_path='checkpoints/test_cls_probs_5folds.npy',
+    output_csv='submissions/submission_5fold_committee.csv',
+    enforce_disjoint=False
 ):
+    if blend_csv is None:
+        blend_csv = 'submissions/submission_calibrated_consensus.csv' if os.path.exists('submissions/submission_calibrated_consensus.csv') else 'submissions/submission_blend_optimal.csv'
+    if multifold_csv is None:
+        multifold_csv = 'kaggle_output_quick/submission.csv' if os.path.exists('kaggle_output_quick/submission.csv') else 'submissions/submission_multifold_ensemble.csv'
     print("================================================================================")
     print("🚀 GENERATING SOTA CONSENSUS ENSEMBLE SUBMISSION")
     print(f"  1. Blend:            {blend_csv}")
@@ -216,9 +220,17 @@ def generate_sota_submission(
     print(f"  Total Rows:         {len(out_df)} (Target: 12000) -> {'PASS' if len(out_df) == 12000 else 'FAIL'}")
     print(f"  Null Values:        {out_df.isnull().sum().sum()} -> {'PASS' if out_df.isnull().sum().sum() == 0 else 'FAIL'}")
     print(f"  Columns:            {list(out_df.columns)} -> PASS")
-    print(f"  Contested Images:   {contested_images} resolved")
-    print(f"  Contested Pixels:   {contested_pixels_total:,} pixels resolved via argmax")
-    print(f"  Remaining Overlaps: 0 overlapping pixels (100% strictly disjoint)")
+    if enforce_disjoint:
+        print(f"  Contested Images:   {contested_images} resolved")
+        print(f"  Contested Pixels:   {contested_pixels_total:,} pixels resolved via argmax")
+        print(f"  Remaining Overlaps: 0 overlapping pixels (100% strictly disjoint)")
+    else:
+        print(f"  Disjoint Mode:      Disabled (preserving non-disjoint Bayesian consensus for maximum recall)")
+
+    # Also update master submission.csv
+    master_sub = 'submissions/submission.csv'
+    out_df.to_csv(master_sub, index=False, quoting=csv.QUOTE_ALL)
+    print(f"✅ Updated master submission at {master_sub}")
 
     empty_cnt = (out_df['mask_rle'].str.strip() == '').sum()
     pos_cnt = len(out_df) - empty_cnt
@@ -236,12 +248,12 @@ def generate_sota_submission(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output', type=str, default='submissions/submission_sota_disjoint.csv')
-    parser.add_argument('--blend', type=str, default='submissions/submission_blend_optimal.csv')
-    parser.add_argument('--multifold', type=str, default='submissions/submission_multifold_ensemble.csv')
+    parser.add_argument('--output', type=str, default='submissions/submission_5fold_committee.csv')
+    parser.add_argument('--blend', type=str, default=None)
+    parser.add_argument('--multifold', type=str, default=None)
     parser.add_argument('--cls-probs', type=str, default='checkpoints/test_cls_probs_5folds.npy')
-    parser.add_argument('--no-disjoint', dest='disjoint', action='store_false', default=True,
-                        help='Disable cross-class disjointness resolution')
+    parser.add_argument('--disjoint', dest='disjoint', action='store_true', default=False,
+                        help='Enable cross-class disjointness resolution (default: False for non-disjoint consensus)')
     args = parser.parse_args()
 
     generate_sota_submission(

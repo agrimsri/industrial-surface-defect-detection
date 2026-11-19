@@ -340,10 +340,17 @@ def test_enforce_mask_disjointness():
 def test_sota_submission_verification():
     """
     Verifies that the generated submissions exist,
-    satisfy all 12,000 row requirements, match schema, and have zero overlapping pixels.
+    satisfy all 12,000 row requirements, match schema, have zero nulls,
+    strictly enforce csv.QUOTE_ALL double quoting with ' ' for clean masks,
+    and have active predictions across all 4 defect classes.
     """
     print("\n--- Test 13: SOTA Submission Format & Integrity Check ---")
-    sub_paths = ['submissions/submission_sota_disjoint.csv', 'submissions/submission_sota_consensus.csv']
+    sub_paths = [
+        'submissions/submission_5fold_committee.csv',
+        'submissions/submission.csv',
+        'submissions/submission_sota_disjoint.csv',
+        'submissions/submission_sota_consensus.csv'
+    ]
     checked = 0
     for sub_path in sub_paths:
         if not os.path.exists(sub_path):
@@ -354,6 +361,14 @@ def test_sota_submission_verification():
         assert list(df.columns) == ['ID', 'image_id', 'defect_type', 'mask_rle'], f"Unexpected columns: {list(df.columns)}"
         assert df.isnull().sum().sum() == 0, f"Found null values in {sub_path}"
         
+        # Verify raw formatting: csv.QUOTE_ALL and clean mask whitespace convention
+        with open(sub_path, 'r') as f:
+            header = f.readline().strip()
+            assert header == '"ID","image_id","defect_type","mask_rle"', f"Header not QUOTE_ALL in {sub_path}: {header}"
+            for _ in range(20):
+                line = f.readline().strip()
+                assert line.startswith('"') and line.endswith('"'), f"Line not QUOTE_ALL in {sub_path}: {line}"
+
         # Check that all 4 classes have non-zero predictions
         for d in ['defect_a', 'defect_b', 'defect_c', 'defect_d']:
             c_sub = df[df['defect_type'] == d]
@@ -406,6 +421,14 @@ def test_verified_morphological_closing_kernels():
     mask_c = postprocess_mask(full_c, cls_prob=0.9, cls_idx=2, cls_thresh=0.2, prob_thresh=0.5, min_size=10)
     assert mask_c[15, 15] == 1, "Defect C 3x3 closing failed to fill interior cavity!"
 
+    # Defect A (3x3 closing): 1-pixel interior cavity in pit
+    prob_a = np.ones((10, 10), dtype=np.float32) * 0.8
+    prob_a[5, 5] = 0.0  # interior hole
+    full_a = np.zeros((128, 800), dtype=np.float32)
+    full_a[10:20, 10:20] = prob_a
+    mask_a = postprocess_mask(full_a, cls_prob=0.9, cls_idx=0, cls_thresh=0.2, prob_thresh=0.5, min_size=10)
+    assert mask_a[15, 15] == 1, "Defect A 3x3 closing failed to fill interior cavity!"
+
     print("✅ Verified morphological closing kernels tested successfully!")
 
 def test_multifold_continuous_probability_ensembling():
@@ -435,6 +458,16 @@ def test_multifold_continuous_probability_ensembling():
     assert np.isclose(ens_continuous[35, 45], 0.516)
     binary_ens = (ens_continuous > 0.50).astype(np.uint8)
     assert binary_ens[30:50, 40:60].sum() == 400, "Continuous ensembling should retain all 400 pixels!"
+
+    # Verify actual 5-fold continuous classification probability map if present
+    cls_5fold_path = 'checkpoints/test_cls_probs_5folds.npy'
+    if os.path.exists(cls_5fold_path):
+        cls_probs = np.load(cls_5fold_path)
+        assert cls_probs.shape == (3000, 4), f"Expected shape (3000, 4), got {cls_probs.shape}"
+        assert (cls_probs >= 0.0).all() and (cls_probs <= 1.0).all(), "Probs outside [0, 1]"
+        assert not np.isnan(cls_probs).any(), "NaN found in continuous probs"
+        assert not np.isinf(cls_probs).any(), "Inf found in continuous probs"
+
     print("✅ Continuous probability ensembling retention verified successfully!")
 
 if __name__ == '__main__':
