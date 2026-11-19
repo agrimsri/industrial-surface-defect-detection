@@ -32,6 +32,7 @@ kaggle_output_new/
 kaggle_output_multifold/
 kaggle_output_folds234/
 kaggle_output_quick/
+kaggle_output_seresnext/
 submissions/*.csv
 checkpoints/*.npz
 checkpoints/*.npy

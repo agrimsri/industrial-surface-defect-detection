@@ -11,12 +11,12 @@ if '.' not in sys.path:
     sys.path.append('.')
 
 from src.dataset import prepare_image_dataframe, DefectDataset
-from src.models import DualHeadMTFPN, BaselineCustomUNet
+from src.models import DualHeadMTFPN, BaselineCustomUNet, SEResNeXt50UNet
 from src.metrics import StreamingMetricMeter, compute_competition_metric
 from src.postprocess import postprocess_mask, rle_encode, rle_decode, enforce_mask_disjointness
 from src.trainer import Trainer
 
-from src.losses import JointMultiTaskLoss
+from src.losses import JointMultiTaskLoss, LovaszHingeLoss
 
 def test_joint_loss_pos_weight():
     """
@@ -470,6 +470,122 @@ def test_multifold_continuous_probability_ensembling():
 
     print("✅ Continuous probability ensembling retention verified successfully!")
 
+def test_seresnext50_unet_forward():
+    """
+    Test 16: Verifies that SEResNeXt50UNet with native 1-channel grayscale backbone
+    and U-Net decoder with DualHead pooling operates correctly across forward and backward passes.
+    """
+    print("\n--- Test 16: SEResNeXt50UNet Architecture & Gradient Flow ---")
+    model = SEResNeXt50UNet(num_classes=4, pretrained=False)
+    x = torch.randn(2, 1, 128, 800)
+    cls_logits, seg_logits = model(x)
+    assert cls_logits.shape == (2, 4), f"Expected (2, 4), got {cls_logits.shape}"
+    assert seg_logits.shape == (2, 4, 128, 800), f"Expected (2, 4, 128, 800), got {seg_logits.shape}"
+    
+    # Check backward pass
+    loss = cls_logits.sum() + seg_logits.sum()
+    loss.backward()
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            assert param.grad is not None, f"Parameter {name} has no gradient"
+    print("✅ SEResNeXt50UNet verified successfully!")
+
+def test_lovasz_hinge_loss():
+    """
+    Test 17: Verifies LovaszHingeLoss behavior on foreground-positive and empty instances,
+    gradient computation, and seamless integration into JointMultiTaskLoss.
+    """
+    print("\n--- Test 17: LovaszHingeLoss & JointMultiTaskLoss Integration ---")
+    lovasz = LovaszHingeLoss(per_image=True, only_present=True)
+    
+    # 1. Edge Case: Empty targets -> 0 loss and 0 gradient
+    logits = torch.randn(2, 4, 32, 64, requires_grad=True)
+    targets_empty = torch.zeros(2, 4, 32, 64)
+    loss_empty = lovasz(logits, targets_empty)
+    assert loss_empty.item() == 0.0
+    loss_empty.backward()
+    assert logits.grad is not None
+    assert torch.all(logits.grad == 0.0)
+    
+    # 2. Foreground-positive instance -> positive loss and non-zero gradient
+    logits = torch.randn(2, 4, 32, 64, requires_grad=True)
+    targets_pos = torch.zeros(2, 4, 32, 64)
+    targets_pos[0, 1, 10:20, 10:20] = 1.0 # Class 1 positive
+    loss_pos = lovasz(logits, targets_pos)
+    assert loss_pos.item() > 0.0
+    loss_pos.backward()
+    assert logits.grad is not None
+    assert torch.any(logits.grad != 0.0)
+    
+    # 3. Integration with JointMultiTaskLoss
+    joint_crit = JointMultiTaskLoss(cls_weight=0.5, bce_weight=0.5, dice_weight=0.5, lovasz_weight=0.5)
+    cls_l = torch.randn(2, 4, requires_grad=True)
+    seg_l = torch.randn(2, 4, 32, 64, requires_grad=True)
+    cls_t = torch.zeros(2, 4)
+    cls_t[0, 1] = 1.0
+    
+    out = joint_crit(cls_l, seg_l, cls_t, targets_pos)
+    assert 'lovasz_loss' in out
+    assert out['lovasz_loss'].item() > 0.0
+    assert out['total_loss'].item() > 0.0
+    out['total_loss'].backward()
+    assert cls_l.grad is not None
+    assert seg_l.grad is not None
+    print("✅ LovaszHingeLoss & JointMultiTaskLoss verified successfully!")
+
+def test_hetero_ensemble_blending():
+    """
+    Test 18: Verifies that blend_hetero_ensemble correctly blends continuous probabilities
+    across heterogeneous models with non-disjoint morphological closing and strict Kaggle formatting.
+    """
+    print("\n--- Test 18: Heterogeneous Ensemble Continuous Blending ---")
+    from scripts.blend_hetero_ensemble import blend_hetero_ensemble
+    
+    test_dir = 'checkpoints/test_seresnext_sim'
+    os.makedirs(test_dir, exist_ok=True)
+    
+    # Create simulated SEResNeXt50 continuous outputs
+    dummy_cls = np.random.uniform(0.1, 0.6, (3000, 4)).astype(np.float32)
+    # Ensure some high-confidence predictions on each class
+    for c in range(4):
+        dummy_cls[:100, c] = 0.85
+    np.save(os.path.join(test_dir, 'test_cls_probs.npy'), dummy_cls)
+    
+    test_output = 'submissions/test_submission_hetero.csv'
+    
+    blend_hetero_ensemble(
+        seresnext_dir=test_dir,
+        committee_cls_path='checkpoints/test_cls_probs_5folds.npy',
+        committee_sub_path='submissions/submission_5fold_committee.csv',
+        sample_sub_path='public/sample_submission.csv',
+        output_path=test_output,
+        master_path=None
+    )
+    
+    assert os.path.exists(test_output), "Test output submission not created"
+    df = pd.read_csv(test_output)
+    assert len(df) == 12000, f"Expected 12000 rows, got {len(df)}"
+    assert list(df.columns) == ['ID', 'image_id', 'defect_type', 'mask_rle']
+    assert df.isnull().sum().sum() == 0, "Found null values"
+    
+    # Check QUOTE_ALL format
+    with open(test_output, 'r') as f:
+        header = f.readline().strip()
+        assert header == '"ID","image_id","defect_type","mask_rle"'
+        first_row = f.readline().strip()
+        assert first_row.startswith('"') and first_row.endswith('"')
+        
+    for d in ['defect_a', 'defect_b', 'defect_c', 'defect_d']:
+        cnt = (df[df['defect_type'] == d]['mask_rle'].fillna('').str.strip() != '').sum()
+        assert cnt > 0, f"Defect class {d} has 0 positive predictions"
+        
+    # Clean up test output
+    if os.path.exists(test_output):
+        os.remove(test_output)
+    import shutil
+    shutil.rmtree(test_dir)
+    print("✅ Heterogeneous ensemble blending verified successfully!")
+
 if __name__ == '__main__':
     test_streaming_metric_equivalence()
     test_val_loader_sanitization()
@@ -487,4 +603,7 @@ if __name__ == '__main__':
     test_sota_submission_verification()
     test_verified_morphological_closing_kernels()
     test_multifold_continuous_probability_ensembling()
-    print("\n🎉 ALL 16 TESTS PASSED!")
+    test_seresnext50_unet_forward()
+    test_lovasz_hinge_loss()
+    test_hetero_ensemble_blending()
+    print("\n🎉 ALL 19 TESTS PASSED!")

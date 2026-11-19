@@ -279,8 +279,24 @@ class TestDefectDataset(Dataset):
         return {'image': img_tensor, 'image_id': image_id}
 
 # =============================================================================
-# 3. SOTA MODEL ARCHITECTURE: High-Resolution Stride-2 DualHead MT-FPN
+# 3. SOTA MODEL ARCHITECTURES: DualHead MT-FPN & SEResNeXt50UNet
 # =============================================================================
+class DoubleConv(nn.Module):
+    """(Conv2D -> BatchNorm -> GELU) * 2"""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 class DualHeadPooling(nn.Module):
     """
     Dual AdaptiveAvgPool2d + AdaptiveMaxPool2d for peak and context defect capture.
@@ -454,9 +470,192 @@ class DualHeadMTFPN(nn.Module):
             seg_logits = F.interpolate(seg_feats, size=x.shape[-2:], mode='bilinear', align_corners=False)
         return cls_logits, seg_logits
 
+class SEResNeXt50UNet(nn.Module):
+    """
+    Model 4: Dense Residual Squeeze-and-Excitation ResNeXt-50 (32x4d) with U-Net Decoder.
+    - Backbone: ImageNet-pretrained 'seresnext50_32x4d' with native 1-channel grayscale (in_chans=1).
+    - Multi-scale high-resolution skip connections down to stride 2 (64 x 400).
+    - U-Net Decoder: Successive transposed convolutions + DoubleConv skip fusion.
+    - DualHead Auxiliary Classifier: Concat(AdaptiveAvgPool2d, AdaptiveMaxPool2d) on bottleneck (C5)
+      predicting 4-class image-level defect probabilities.
+    - Output: (cls_logits [B, 4], seg_logits [B, 4, 128, 800])
+    """
+    def __init__(self, num_classes=4, pretrained=True, dropout=0.3):
+        super().__init__()
+        try:
+            self.encoder = timm.create_model(
+                'seresnext50_32x4d',
+                pretrained=pretrained,
+                features_only=True,
+                in_chans=1
+            )
+        except Exception:
+            self.encoder = timm.create_model(
+                'seresnext50_32x4d',
+                pretrained=pretrained,
+                features_only=True
+            )
+            self._adapt_first_conv_to_grayscale()
+
+        self.feature_channels = self.encoder.feature_info.channels()
+        # Typical channels: [64, 256, 512, 1024, 2048]
+        c5_ch = self.feature_channels[-1]
+
+        # Auxiliary Classification Head (DualHead pooling Avg + Max)
+        self.cls_head = DualHeadPooling(c5_ch, hidden_dim=256, num_classes=num_classes, dropout=dropout)
+
+        # U-Net Decoder blocks
+        # Stage 4: 2048 -> 512, skip 1024 -> out 512
+        self.up4 = nn.ConvTranspose2d(self.feature_channels[4], 512, kernel_size=2, stride=2)
+        self.dec4 = DoubleConv(512 + self.feature_channels[3], 512)
+
+        # Stage 3: 512 -> 256, skip 512 -> out 256
+        self.up3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(256 + self.feature_channels[2], 256)
+
+        # Stage 2: 256 -> 128, skip 256 -> out 128
+        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(128 + self.feature_channels[1], 128)
+
+        # Stage 1: 128 -> 64, skip 64 (stride 2) -> out 64
+        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(64 + self.feature_channels[0], 64)
+
+        # Stage 0: 64 -> 32 (stride 1, 128 x 800) -> out num_classes
+        self.up0 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec0 = DoubleConv(32, 32)
+        self.seg_out = nn.Conv2d(32, num_classes, kernel_size=1)
+
+    def _adapt_first_conv_to_grayscale(self):
+        conv1 = None
+        parent_name = ''
+        attr_name = ''
+        for name, module in self.encoder.named_modules():
+            if isinstance(module, nn.Conv2d) and module.in_channels == 3:
+                conv1 = module
+                if '.' in name:
+                    parent_name, attr_name = name.rsplit('.', 1)
+                else:
+                    attr_name = name
+                break
+                
+        if conv1 is not None:
+            w_3ch = conv1.weight.data
+            w_1ch = w_3ch.sum(dim=1, keepdim=True)
+            new_conv = nn.Conv2d(
+                in_channels=1,
+                out_channels=conv1.out_channels,
+                kernel_size=conv1.kernel_size,
+                stride=conv1.stride,
+                padding=conv1.padding,
+                bias=(conv1.bias is not None)
+            )
+            new_conv.weight.data.copy_(w_1ch)
+            if conv1.bias is not None:
+                new_conv.bias.data.copy_(conv1.bias.data)
+            if parent_name:
+                parent = dict(self.encoder.named_modules())[parent_name]
+            else:
+                parent = self.encoder
+            setattr(parent, attr_name, new_conv)
+
+    def forward(self, x):
+        feats = self.encoder(x)
+        cls_logits = self.cls_head(feats[-1])
+
+        d4 = self.dec4(torch.cat([self.up4(feats[4]), feats[3]], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), feats[2]], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), feats[1]], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), feats[0]], dim=1))
+        d0 = self.dec0(self.up0(d1))
+        seg_logits = self.seg_out(d0)
+
+        return cls_logits, seg_logits
+
+def get_model(backbone_name='seresnext50_32x4d', num_classes=4, pretrained=True, enhanced=False):
+    """Factory creating appropriate model architecture based on backbone name."""
+    if 'seresnext' in backbone_name.lower():
+        return SEResNeXt50UNet(num_classes=num_classes, pretrained=pretrained)
+    else:
+        return DualHeadMTFPN(backbone_name=backbone_name, num_classes=num_classes, pretrained=pretrained, enhanced=enhanced)
+
 # =============================================================================
-# 4. LOSS FUNCTIONS
+# 4. LOSS FUNCTIONS: Pos-Weighted BCE + Foreground SoftDice + Lovász-Hinge
 # =============================================================================
+def lovasz_grad(gt_sorted):
+    """
+    Computes gradient of the Lovasz extension with respect to sorted errors.
+    See Berman et al., CVPR 2018.
+    """
+    p = len(gt_sorted)
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1.0 - gt_sorted).float().cumsum(0)
+    jaccard = 1.0 - intersection / union
+    if p > 1:
+        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+    return jaccard
+
+def lovasz_hinge_flat(logits, targets):
+    """
+    Binary Lovasz hinge loss on 1D flattened tensors.
+    logits: [P] Variable, logits at each pixel prediction
+    targets: [P] Tensor, binary ground truth labels (0 or 1)
+    """
+    if len(logits) == 0:
+        return logits.sum() * 0.0
+    signs = 2.0 * targets.float() - 1.0
+    errors = 1.0 - logits * signs
+    errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
+    perm = perm.data
+    gt_sorted = targets[perm]
+    grad = lovasz_grad(gt_sorted)
+    loss = torch.dot(F.relu(errors_sorted), grad)
+    return loss
+
+class LovaszHingeLoss(nn.Module):
+    """
+    Lovász-Hinge loss for binary segmentation fine-tuning.
+    Optimizes the Jaccard index / IoU surrogate directly via Lovász extension of submodular losses.
+    When only_present=True, only computes loss over foreground-positive instances (targets.sum() > 0),
+    matching competition metric dynamics and preventing artificial penalties on empty slices.
+    """
+    def __init__(self, per_image=True, only_present=True):
+        super().__init__()
+        self.per_image = per_image
+        self.only_present = only_present
+
+    def forward(self, logits, targets):
+        if self.per_image:
+            B, C, H, W = logits.shape
+            total_loss = 0.0
+            count = 0
+            for b in range(B):
+                for c in range(C):
+                    t = targets[b, c]
+                    is_pos = (t.sum() > 0)
+                    if self.only_present and not is_pos:
+                        continue
+                    l = logits[b, c].reshape(-1)
+                    t_flat = t.reshape(-1)
+                    total_loss = total_loss + lovasz_hinge_flat(l, t_flat)
+                    count += 1
+            if count > 0:
+                return total_loss / count
+            else:
+                return (logits * 0.0).sum()
+        else:
+            if self.only_present:
+                B, C, H, W = logits.shape
+                pos_mask = (targets.view(B, C, -1).sum(dim=2) > 0)
+                if not pos_mask.any():
+                    return (logits * 0.0).sum()
+                logits_pos = logits.permute(0, 1, 2, 3)[pos_mask].view(-1)
+                targets_pos = targets.permute(0, 1, 2, 3)[pos_mask].view(-1)
+                return lovasz_hinge_flat(logits_pos, targets_pos)
+            else:
+                return lovasz_hinge_flat(logits.view(-1), targets.view(-1))
+
 class SoftDiceLoss(nn.Module):
     """
     Foreground-only Soft Dice Loss for binary segmentation.
@@ -488,13 +687,14 @@ class SoftDiceLoss(nn.Module):
 class JointMultiTaskLoss(nn.Module):
     """
     Joint multi-task loss with positive class weighting (pos_weight)
-    to boost recall on minority defect classes.
+    and optional Lovász-Hinge fine-tuning for foreground instances.
     """
-    def __init__(self, cls_weight=0.5, bce_weight=0.5, dice_weight=0.5, pos_weight=None):
+    def __init__(self, cls_weight=0.5, bce_weight=0.5, dice_weight=0.5, lovasz_weight=0.0, pos_weight=None):
         super().__init__()
         self.cls_weight = cls_weight
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
+        self.lovasz_weight = lovasz_weight
         
         if pos_weight is not None:
             if not isinstance(pos_weight, torch.Tensor):
@@ -506,6 +706,7 @@ class JointMultiTaskLoss(nn.Module):
             self.bce_seg = nn.BCEWithLogitsLoss()
             
         self.dice_seg = SoftDiceLoss()
+        self.lovasz_seg = LovaszHingeLoss(per_image=True, only_present=True)
 
     def forward(self, cls_logits, seg_logits, cls_targets, seg_targets):
         l_cls = self.bce_cls(cls_logits, cls_targets)
@@ -514,6 +715,13 @@ class JointMultiTaskLoss(nn.Module):
         l_dice = self.dice_seg(probs, seg_targets)
         
         l_seg = self.bce_weight * l_bce + self.dice_weight * l_dice
+        
+        if self.lovasz_weight > 0.0:
+            l_lovasz = self.lovasz_seg(seg_logits, seg_targets)
+            l_seg = l_seg + self.lovasz_weight * l_lovasz
+        else:
+            l_lovasz = torch.tensor(0.0, device=cls_logits.device)
+            
         l_total = l_seg + self.cls_weight * l_cls
         
         return {
@@ -521,7 +729,8 @@ class JointMultiTaskLoss(nn.Module):
             'seg_loss': l_seg,
             'cls_loss': l_cls,
             'bce_loss': l_bce,
-            'dice_loss': l_dice
+            'dice_loss': l_dice,
+            'lovasz_loss': l_lovasz
         }
 
 # =============================================================================
@@ -689,17 +898,18 @@ def train_fold(
     df,
     fold=0,
     train_img_dir='.',
-    backbone='tf_efficientnetv2_s',
-    epochs=7,
-    batch_size=12,
+    backbone='seresnext50_32x4d',
+    epochs=16,
+    batch_size=16,
     accum_steps=1,
-    lr=5e-4,
+    lr=4e-4,
+    weight_decay=1e-2,
     device='cuda',
     save_dir='.'
 ):
     print("=" * 80)
-    print(f"🚀 TRAINING FOLD {fold}: Dual-Head MT-FPN ({backbone} Stride-2)")
-    print(f"Device: {device} | Epochs: {epochs} | Batch Size: {batch_size} (Accum: {accum_steps}) | LR: {lr}")
+    print(f"🚀 TRAINING FOLD {fold}: Dense Residual {backbone} (Native 128x800 U-Net)")
+    print(f"Device: {device} | Epochs: {epochs} | Batch Size: {batch_size} (Accum: {accum_steps}) | LR: {lr} | WD: {weight_decay}")
     print("=" * 80)
     
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -740,23 +950,25 @@ def train_fold(
     )
     
     # Model
-    model = DualHeadMTFPN(backbone_name=backbone, num_classes=4, pretrained=True).to(device)
+    model = get_model(backbone_name=backbone, num_classes=4, pretrained=True).to(device)
     
-    # Optimizer with Warmup + Cosine Annealing
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # Optimizer with Warmup + Cosine Annealing (lr: 4e-4, weight_decay: 1e-2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
-    # Scheduler: 1-epoch linear warmup, then cosine decay
+    # Scheduler: 1-epoch linear warmup, then cosine decay down to 1e-6
+    lr_min = 1e-6
     def lr_lambda(epoch):
         if epoch < 1:
-            return 0.1 + 0.9 * epoch
+            return (lr_min + (lr - lr_min) * epoch) / lr
         progress = (epoch - 1) / max(1, epochs - 1)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        current = lr_min + 0.5 * (lr - lr_min) * (1.0 + math.cos(math.pi * progress))
+        return current / lr
         
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     
-    # Loss: Pos-weighted BCE on defect_a & defect_b + Foreground SoftDice
+    # Loss: Pos-weighted BCE + Foreground SoftDice (+ Lovász-Hinge in final 4 epochs)
     pos_weight = torch.tensor([2.0, 3.0, 1.0, 1.5], dtype=torch.float32, device=device)
-    criterion = JointMultiTaskLoss(cls_weight=0.5, bce_weight=0.5, dice_weight=0.5, pos_weight=pos_weight).to(device)
+    criterion = JointMultiTaskLoss(cls_weight=0.5, bce_weight=0.5, dice_weight=0.5, lovasz_weight=0.0, pos_weight=pos_weight).to(device)
     
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
     
@@ -764,7 +976,7 @@ def train_fold(
     best_epoch = -1
     best_ckpt_path = os.path.join(save_dir, f'model_fold_{fold}_best.pth')
     
-    # Snapshot checkpoints for SWA ensemble
+    # Snapshot checkpoints for SWA ensemble (final 5 epochs)
     snapshot_states = []
     
     for epoch in range(1, epochs + 1):
@@ -772,6 +984,12 @@ def train_fold(
         model.train()
         running_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
+
+        # Lovász fine-tuning on foreground-positive instances for final 4 epochs
+        if epoch >= max(1, epochs - 3):
+            if criterion.lovasz_weight == 0.0:
+                print(f"  🔥 Epoch {epoch}: Activating Lovász-Hinge foreground fine-tuning (lovasz_weight=0.5)")
+                criterion.lovasz_weight = 0.5
         
         for step, batch in enumerate(train_loader):
             images = batch['image'].to(device, non_blocking=True)
@@ -857,8 +1075,8 @@ def train_fold(
             }, best_ckpt_path)
             print(f"  ⭐ Fold {fold}: Saved new best checkpoint (+{improvement:.5f}) to {best_ckpt_path}")
             
-        # Collect snapshots from the last 3 epochs for SWA
-        if epoch >= max(1, epochs - 2):
+        # Collect snapshots from the final 5 epochs for SWA
+        if epoch >= max(1, epochs - 4):
             cpu_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             snapshot_states.append(cpu_state)
             
@@ -950,7 +1168,7 @@ def calibrate_thresholds(
         val_ds = DefectDataset(v_df, img_dir=train_img_dir, is_train=False, augment=False)
         val_loader = DataLoader(val_ds, batch_size=16, shuffle=False, num_workers=0, pin_memory=False)
         
-        model = DualHeadMTFPN(backbone_name=backbone, num_classes=4, pretrained=False).to(device)
+        model = get_model(backbone_name=backbone, num_classes=4, pretrained=False).to(device)
         ckpt = torch.load(m_path, map_location=device)
         model.load_state_dict(ckpt['model_state_dict'])
         model.eval()
@@ -1127,7 +1345,7 @@ def generate_submission(
     
     models = []
     for mp in model_paths:
-        m = DualHeadMTFPN(backbone_name=backbone, num_classes=4, pretrained=False).to(device)
+        m = get_model(backbone_name=backbone, num_classes=4, pretrained=False).to(device)
         ckpt = torch.load(mp, map_location=device)
         m.load_state_dict(ckpt['model_state_dict'])
         m.eval()
@@ -1235,10 +1453,13 @@ def generate_submission(
     save_dir = os.path.dirname(os.path.abspath(output_path))
     cls_save_path = os.path.join(save_dir, 'test_cls_probs.npy')
     seg_save_path = os.path.join(save_dir, 'test_seg_probs.npy')
+    seg_npz_path = os.path.join(save_dir, 'test_seg_probs.npz')
     np.save(cls_save_path, all_test_cls_probs)
     np.save(seg_save_path, all_test_seg_probs)
+    np.savez_compressed(seg_npz_path, seg_probs=all_test_seg_probs)
     print(f"✅ Saved continuous test classification probabilities to {cls_save_path} (shape {all_test_cls_probs.shape})")
     print(f"✅ Saved continuous test segmentation probabilities to {seg_save_path} (shape {all_test_seg_probs.shape})")
+    print(f"✅ Saved compressed continuous test segmentation probabilities to {seg_npz_path}")
         
     print("Formatting submission rows matching sample_submission.csv...")
     rows = []
@@ -1287,12 +1508,13 @@ def generate_submission(
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--backbone', type=str, default='tf_efficientnetv2_s')
-    parser.add_argument('--epochs', type=int, default=7)
-    parser.add_argument('--folds', type=str, default='2,3,4')
-    parser.add_argument('--batch-size', type=int, default=12)
+    parser.add_argument('--backbone', type=str, default='seresnext50_32x4d')
+    parser.add_argument('--epochs', type=int, default=16)
+    parser.add_argument('--folds', type=str, default='0')
+    parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--accum-steps', type=int, default=1)
-    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--lr', type=float, default=4e-4)
+    parser.add_argument('--weight-decay', type=float, default=1e-2)
     args, _ = parser.parse_known_args()
     
     train_csv, sample_sub, train_dir, test_dir = find_data_paths()
@@ -1300,7 +1522,7 @@ def main():
     
     # 1. Parse folds and prepare data
     folds_to_train = [int(f.strip()) for f in args.folds.split(',') if f.strip()]
-    print(f"🚀 Execution plan: Backbone={args.backbone} | Folds={folds_to_train} | Epochs per fold={args.epochs}")
+    print(f"🚀 Execution plan: Backbone={args.backbone} | Folds={folds_to_train} | Epochs per fold={args.epochs} | LR={args.lr} | WD={args.weight_decay}")
     df = prepare_image_dataframe(train_csv, n_splits=5, seed=42)
     
     trained_models = []
@@ -1317,6 +1539,7 @@ def main():
             batch_size=args.batch_size,
             accum_steps=args.accum_steps,
             lr=args.lr,
+            weight_decay=args.weight_decay,
             save_dir=work_dir
         )
         best_path = os.path.join(work_dir, f'model_fold_{fold}_best.pth')
